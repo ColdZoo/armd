@@ -1,0 +1,3 @@
+# 编译产物放本地盘，避免 NFS 上的文件锁/性能问题
+[build]
+target-dir = "/tmp/armd-target"

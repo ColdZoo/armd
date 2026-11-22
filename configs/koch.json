@@ -1,0 +1,25 @@
+{
+  "socket": "/tmp/armd.sock",
+  "arms": [
+    {
+      "id": "koch_v1_1:leader",
+      "label": "Koch v1.1 主臂 LEADER",
+      "port": "/dev/cu.usbmodem5AB01834471",
+      "baud": 1000000,
+      "poll_hz": 60,
+      "read_timeout_ms": 30,
+      "reconnect_sec": 2.0,
+      "motors": [1, 2, 3, 4, 5, 6]
+    },
+    {
+      "id": "koch_v1_1:follower",
+      "label": "Koch v1.1 从臂 FOLLOWER",
+      "port": "/dev/cu.usbmodem5A7C1190831",
+      "baud": 1000000,
+      "poll_hz": 60,
+      "read_timeout_ms": 30,
+      "reconnect_sec": 2.0,
+      "motors": [1, 2, 3, 4, 5, 6]
+    }
+  ]
+}
