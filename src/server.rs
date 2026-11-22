@@ -387,6 +387,38 @@ impl Daemon {
                 }
                 Ok(json!({ "profile": clean, "path": arm.profile_store.path().to_string_lossy() }))
             }
+            "arm.profile.history" => {
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let items: Vec<Value> = arm
+                    .profile_store
+                    .history()
+                    .into_iter()
+                    .map(|(name, saved_at)| json!({"name": name, "savedAt": saved_at}))
+                    .collect();
+                Ok(json!({"history": items, "dir": arm.profile_store.history_dir().to_string_lossy()}))
+            }
+            "arm.profile.restore" => {
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let name = str_param(params, "name")?;
+                let payload = arm
+                    .profile_store
+                    .history_file(&name)
+                    .map_err(|e| RpcError::new("bad_request", e))?;
+                let clean = validate_profile(&payload, &arm.cfg.joint_names)
+                    .map_err(|e| RpcError::new("bad_request", e))?;
+                arm.profile_store
+                    .save(&clean)
+                    .map_err(|e| RpcError::new("io_error", e))?;
+                *arm.profile.lock().unwrap() = Some(clean.clone());
+                {
+                    let mut st = arm.state.write().unwrap();
+                    if !st.joints.is_empty() {
+                        st.deg = joint_degrees(&st.joints, &arm.cfg.joint_names, &clean);
+                    }
+                    st.profile_saved_at = clean.get("savedAt").and_then(|v| v.as_i64());
+                }
+                Ok(json!({"restored": name, "profile": clean}))
+            }
             "arm.profile.delete" => {
                 let arm = self.arm(&str_param(params, "arm")?)?;
                 let deleted = arm.profile_store.delete();

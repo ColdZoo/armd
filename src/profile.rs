@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const HISTORY_KEEP: usize = 20;
+
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -163,10 +165,90 @@ impl ProfileStore {
         serde_json::from_str(&text).ok()
     }
 
+    /// 历史目录：`<profile 同目录>/history/<stem>-<unix>.json`
+    pub fn history_dir(&self) -> PathBuf {
+        self.path.parent().map(|p| p.join("history")).unwrap_or_else(|| PathBuf::from("history"))
+    }
+
+    fn snapshot_history(&self) {
+        let old = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(_) => return,
+        };
+        let dir = self.history_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let stem = self
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "profile".into());
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let dest = dir.join(format!("{stem}-{ts}.json"));
+        if std::fs::write(&dest, old).is_err() {
+            return;
+        }
+        // 只保留最近 HISTORY_KEEP 份
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut names: Vec<(String, PathBuf)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with(&format!("{stem}-")) && name.ends_with(".json") {
+                        Some((name.clone(), e.path()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            while names.len() > HISTORY_KEEP {
+                let (_, path) = names.remove(0);
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// 列出历史快照（按时间从新到旧）：[(文件名, savedAt)]
+    pub fn history(&self) -> Vec<(String, Option<i64>)> {
+        let dir = self.history_dir();
+        let stem = self
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "profile".into());
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !(name.starts_with(&format!("{stem}-")) && name.ends_with(".json")) {
+                    continue;
+                }
+                let saved_at = std::fs::read_to_string(e.path())
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                    .and_then(|v| v.get("savedAt").and_then(|x| x.as_i64()));
+                out.push((name, saved_at));
+            }
+        }
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out
+    }
+
+    /// 读取某份历史快照内容
+    pub fn history_file(&self, name: &str) -> Result<Value, String> {
+        if !name.ends_with(".json") || name.contains('/') || name.contains('\\') {
+            return Err("非法历史文件名".into());
+        }
+        let path = self.history_dir().join(name);
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("读取历史失败: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("解析历史失败: {e}"))
+    }
+
     pub fn save(&self, profile: &Value) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
         }
+        self.snapshot_history();
         let body = serde_json::to_string_pretty(profile).map_err(|e| e.to_string())?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, format!("{body}\n")).map_err(|e| format!("写临时文件失败: {e}"))?;
@@ -226,6 +308,24 @@ mod tests {
         assert!((deg["shoulder_pan"] - 43.24).abs() < 0.01);
         // grip: (2887-2047)/1246 = 0.674 → 60.66°
         assert!((deg["gripper"] - 60.66).abs() < 0.1);
+    }
+
+    #[test]
+    fn store_keeps_history_on_overwrite() {
+        let dir = std::env::temp_dir().join(format!("armd-profile-hist-{}", std::process::id()));
+        let store = ProfileStore::new(dir.join("p.json"));
+        let mut a = validate(&sample(), &names()).unwrap();
+        a["savedAt"] = json!(100);
+        store.save(&a).unwrap();
+        let mut b = validate(&sample(), &names()).unwrap();
+        b["savedAt"] = json!(200);
+        store.save(&b).unwrap();
+        let hist = store.history();
+        assert_eq!(hist.len(), 1, "{hist:?}");
+        let old = store.history_file(&hist[0].0).unwrap();
+        assert_eq!(old["savedAt"], 100);
+        assert_eq!(store.load().unwrap()["savedAt"], 200);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -151,6 +151,14 @@ class ArmdClient:
         """保存标定档案（由 armd 校验并持久化）。"""
         return self.request("arm.profile.set", arm=arm, profile=profile)
 
+    def profile_history(self, arm: str) -> dict:
+        """标定历史快照列表 {history:[{name,savedAt}], dir}。"""
+        return self.request("arm.profile.history", arm=arm)
+
+    def restore_profile(self, arm: str, name: str) -> dict:
+        """从历史快照恢复标定（armd 校验后覆盖当前 profile）。"""
+        return self.request("arm.profile.restore", arm=arm, name=name)
+
     def delete_profile(self, arm: str) -> dict:
         return self.request("arm.profile.delete", arm=arm)
 
@@ -292,6 +300,8 @@ def _main() -> None:
     p = sub.add_parser("profile"); p.add_argument("arm")
     p.add_argument("--set", default=None, help="profile JSON 文件路径")
     p.add_argument("--delete", action="store_true")
+    p.add_argument("--history", action="store_true")
+    p.add_argument("--restore", default=None, help="历史快照文件名")
     p = sub.add_parser("snapshot"); p.add_argument("arm")
     p = sub.add_parser("watch"); p.add_argument("arm"); p.add_argument("--rate", type=float, default=10.0)
     p = sub.add_parser("torque"); p.add_argument("arm"); p.add_argument("on", type=int)
@@ -312,6 +322,10 @@ def _main() -> None:
         elif args.cmd == "profile":
             if args.delete:
                 print(json.dumps(c.delete_profile(args.arm)))
+            elif args.history:
+                print(json.dumps(c.profile_history(args.arm), ensure_ascii=False, indent=2))
+            elif args.restore:
+                print(json.dumps(c.restore_profile(args.arm, args.restore), ensure_ascii=False, indent=2))
             elif args.set:
                 with open(args.set, encoding="utf-8") as fp:
                     out = c.set_profile(args.arm, json.load(fp))
