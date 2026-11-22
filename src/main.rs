@@ -2,7 +2,13 @@
 
 use armd::config::{ArmConfig, Config};
 use armd::server::Daemon;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::sync::Arc;
+
+/// 开发文档（`scripts/gen-armd-doc.py` 由 docs/api.json 生成）
+const DOCS_HTML: &str = include_str!("../docs/armd.html");
+const DOCS_API: &str = include_str!("../docs/api.json");
 
 fn usage() {
     println!(
@@ -27,12 +33,26 @@ fn main() {
     let mut sim = false;
     let mut ids: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
     let mut rate = 60.0f64;
+    let mut docs = false;
+    let mut docs_port: u16 = 8790;
+    let mut docs_bind = String::from("127.0.0.1");
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => config_path = args.next(),
             "--socket" => socket = args.next(),
             "--sim" => sim = true,
+            "--docs" => docs = true,
+            "--docs-bind" => {
+                if let Some(v) = args.next() {
+                    docs_bind = v;
+                }
+            }
+            "--docs-port" => {
+                if let Some(v) = args.next() {
+                    docs_port = v.parse().unwrap_or(8790);
+                }
+            }
             "--ids" => {
                 if let Some(v) = args.next() {
                     ids = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
@@ -57,6 +77,14 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if docs {
+        if let Err(e) = serve_docs(&docs_bind, docs_port) {
+            eprintln!("[armd] 文档站启动失败: {e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let cfg = if sim || config_path.is_none() {
@@ -130,6 +158,39 @@ fn main() {
         eprintln!("[armd] 服务退出: {e}");
         std::process::exit(1);
     }
+}
+
+/// 极简只读文档站：`GET /` 或 `/armd.html` → HTML；`/api.json` → 机器可读规范。
+fn serve_docs(bind: &str, port: u16) -> std::io::Result<()> {
+    let listener = TcpListener::bind((bind, port))?;
+    println!("[armd] 文档站: http://{bind}:{port}/  （/api.json 为机器可读规范，Ctrl+C 退出）");
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(match stream.try_clone() {
+                Ok(s) => s,
+                Err(_) => return,
+            });
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                return;
+            }
+            let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let (status, ctype, body) = match path.split('?').next().unwrap_or("/") {
+                "/" | "/index.html" | "/armd.html" => ("200 OK", "text/html; charset=utf-8", DOCS_HTML),
+                "/api.json" => ("200 OK", "application/json; charset=utf-8", DOCS_API),
+                _ => ("404 Not Found", "text/plain; charset=utf-8", "not found"),
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+        });
+    }
+    Ok(())
 }
 
 fn default_config_path() -> String {

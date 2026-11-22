@@ -96,6 +96,14 @@ python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:
 - `arm.state` 会带 `deg`（标定后的关节角）和 `health`（电压/温度），其他应用直接可用
 - 插上臂第一次启动时，若 armd 没有 profile，zeropose 会自动把本地旧标定迁移进来
 
+## 开发文档（给其他 agent/应用）
+
+- **HTML 文档（自包含，可直接浏览器打开）**：[`docs/armd.html`](docs/armd.html) —— 架构、配置、协议、全部 RPC 方法、事件、profile、示例、排障 FAQ
+- **机器可读规范**：[`docs/api.json`](docs/api.json)（HTML 由它生成：`python3 scripts/gen-armd-doc.py`）
+- **本地文档站**：`armd --docs`（默认 http://127.0.0.1:8790/ ，`/api.json` 给程序读）；
+  air.my 上已装 LaunchAgent `com.armd.docs`，常驻 http://127.0.0.1:8790/ ，局域网可看 `http://air.my:8790/`
+- 文档里 `…`、字段含义、错误码齐全，其他 agent 基于 `docs/api.json` + `docs/armd.html` 开发即可
+
 ## 客户端
 
 - Python（零依赖，标准库）：[`clients/python/armd_client.py`](clients/python/armd_client.py)

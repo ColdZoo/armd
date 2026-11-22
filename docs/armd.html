@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>armd — 机械臂串口守护进程 · 开发文档 v0.1.0</title>
+<style>
+  :root {
+    --bg: #0b1220; --panel: #111a2b; --text: #dbe6f3; --muted: #8aa0b8;
+    --accent: #42f5e9; --accent2: #7dd3fc; --border: #22304a; --code-bg: #0a1020;
+    --warn: #fbbf24; --ok: #34d399; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", "Noto Sans SC", sans-serif;
+  }
+  .layout { display: flex; min-height: 100vh; }
+  aside {
+    width: 260px; flex: 0 0 260px; background: var(--panel); border-right: 1px solid var(--border);
+    position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 22px 18px;
+  }
+  aside h1 { font-size: 18px; margin: 0 0 4px; color: var(--accent); letter-spacing: .5px; }
+  aside .ver { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+  aside .search { width: 100%; padding: 7px 9px; margin-bottom: 14px; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--code-bg); color: var(--text); font-size: 13px; }
+  .toc { list-style: none; padding: 0; margin: 0; }
+  .toc li { margin: 2px 0; }
+  .toc a { color: var(--text); text-decoration: none; font-size: 13.5px; display: block;
+    padding: 4px 8px; border-radius: 6px; }
+  .toc a:hover, .toc a.active { background: rgba(66,245,233,.12); color: var(--accent); }
+  main { flex: 1; min-width: 0; padding: 34px 44px 90px; max-width: 1080px; }
+  h1.page { font-size: 30px; margin: 0 0 6px; }
+  h1.page small { font-size: 14px; color: var(--muted); font-weight: 400; }
+  .meta { color: var(--muted); font-size: 13px; margin-bottom: 26px; }
+  section.block { margin: 0 0 40px; }
+  h2 { font-size: 22px; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin: 36px 0 14px; }
+  h3 { font-size: 16px; margin: 22px 0 8px; color: var(--accent2); }
+  h4 { font-size: 13.5px; margin: 14px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  p { margin: 8px 0; }
+  a { color: var(--accent2); }
+  ul, ol { padding-left: 22px; }
+  li { margin: 3px 0; }
+  code { background: rgba(66,245,233,.08); color: var(--accent); padding: 1px 5px; border-radius: 4px;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre.code { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; overflow-x: auto; margin: 8px 0; }
+  pre.code code { background: none; color: #cfe3f7; padding: 0; font-size: 12.5px; }
+  .table-wrap { overflow-x: auto; margin: 10px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: rgba(125,211,252,.08); color: var(--accent2); font-weight: 600; }
+  tr:nth-child(even) td { background: rgba(255,255,255,.015); }
+  .muted { color: var(--muted); }
+  .note, .warn { border-left: 3px solid var(--accent); background: rgba(66,245,233,.06);
+    padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 12px 0; }
+  .warn { border-left-color: var(--warn); background: rgba(251,191,36,.07); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .card b { color: var(--accent); }
+  .method { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 16px 14px; margin: 14px 0; }
+  .method h3 { margin-top: 10px; }
+  .ascii { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; overflow-x: auto; font: 12px/1.45 ui-monospace, Menlo, monospace;
+    color: #b9d4ee; white-space: pre; }
+  footer { color: var(--muted); font-size: 12.5px; border-top: 1px solid var(--border);
+    margin-top: 40px; padding-top: 14px; }
+  @media (max-width: 900px) {
+    .layout { display: block; }
+    aside { position: static; width: auto; height: auto; border-right: 0; border-bottom: 1px solid var(--border); }
+    main { padding: 22px 18px 60px; }
+  }
+  @media print {
+    aside { display: none; } body { background: #fff; color: #111; }
+    main { max-width: none; } pre.code { background: #f5f7fa; } code { color: #0b63b3; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <h1>armd</h1>
+  <div class="ver">v0.1.0 · 更新于 2026-11-22<br>机械臂串口守护进程</div>
+  <input class="search" id="search" placeholder="搜索方法/配置/错误码…" autocomplete="off">
+  
+<ul class="toc">
+  <li><a href="#overview">概览</a></li>
+  <li><a href="#quickstart">快速开始</a></li>
+  <li><a href="#architecture">架构与队列</a></li>
+  <li><a href="#install">安装部署</a></li>
+  <li><a href="#config">配置参考</a></li>
+  <li><a href="#protocol">传输与协议</a></li>
+  <li><a href="#methods">RPC 方法</a></li>
+  <li><a href="#events">发布订阅</a></li>
+  <li><a href="#profile">标定档案 profile</a></li>
+  <li><a href="#clients">客户端与示例</a></li>
+  <li><a href="#errors">错误码</a></li>
+  <li><a href="#faq">排障 FAQ</a></li>
+  <li><a href="#changelog">版本</a></li>
+</ul>
+
+</aside>
+<main>
+  <h1 class="page">armd — 机械臂串口守护进程 <small>开发文档</small></h1>
+  <div class="meta">Dynamixel 机械臂串口守护进程：独占串口总线，对上层提供 NDJSON RPC 与发布订阅；持有标定档案（profile）。</div>
+
+  <section class="block" id="overview">
+    <h2>概览</h2>
+    <p><b>armd</b> 是机械臂的<b>用户态设备驱动</b>：系统里唯一打开 Dynamixel 串口的进程。
+    它按固定节拍（默认 60Hz）轮询每条总线上的所有舵机，把状态分发给所有订阅者，
+    并通过 RPC 接受读/写/标定操作。上层应用（ZeroPose、遥操作、脚本、下位机上的其他服务）
+    <b>从不直接碰串口</b>，只连 armd。</p>
+    <div class="grid">
+      <div class="card"><b>单进程多臂</b><br>一条总线一个 worker 线程；主臂/从臂可同时在线</div>
+      <div class="card"><b>RPC + 发布订阅</b><br>Unix socket / TCP 上的 NDJSON；任意语言可接</div>
+      <div class="card"><b>标定档案</b><br>zero/sign/grip 由 armd 持有，自动历史快照可恢复</div>
+      <div class="card"><b>ARM 下位机</b><br>交叉编译 aarch64/armv7，systemd + TCP + token</div>
+    </div>
+    <div class="note">快速判断"该不该用 armd"：只要你的程序需要读/写机械臂舵机，就应该连 armd；
+    需要标定后的关节角，直接读 <code>arm.state.deg</code>，不用自己实现换算。</div>
+  </section>
+
+  <section class="block" id="quickstart">
+    <h2>快速开始</h2>
+    <h3>1. 启动守护进程（air.my 已用 LaunchAgent 常驻）</h3>
+    <pre class="code"><code># 真机（配置见 ~/.config/armd/config.json）
+~/.local/bin/armd --config ~/.config/armd/config.json
+# 无硬件自测
+armd --sim --socket /tmp/armd-sim.sock
+
+# LaunchAgent 管理（air.my）
+launchctl kickstart -k gui/$(id -u)/com.armd   # 重启
+launchctl print    gui/$(id -u)/com.armd       # 状态
+tail -f /tmp/armd.log                          # 日志</code></pre>
+    <h3>2. 用 Python 客户端调一下</h3>
+    <pre class="code"><code>cd ~/nfs/raid/Projects/armd
+python3 clients/python/armd_client.py --socket /tmp/armd.sock info
+python3 clients/python/armd_client.py --socket /tmp/armd.sock arms
+python3 clients/python/armd_client.py --socket /tmp/armd.sock state koch_v1_1:follower</code></pre>
+    <h3>3. 网络/下位机场景</h3>
+    <pre class="code"><code>armd --config /etc/armd/config.json       # 板上：listen 含 tcp://0.0.0.0:8771 + token
+python3 clients/python/armd_client.py --socket tcp://arm-board.my:8771 --token $ARMD_TOKEN arms</code></pre>
+  </section>
+
+  <section class="block" id="architecture">
+    <h2>架构与队列</h2>
+    <div class="ascii">客户端 A（ZeroPose）   客户端 B（遥操作）   客户端 C（脚本/agent）
+        │ RPC/订阅             │                     │
+        └──────────────┬───────┴─────────────────────┘
+                       ▼  Unix socket 或 TCP（NDJSON）
+              ┌───────────────────────────┐
+              │           armd            │
+              │  conn 线程 × N（每客户端） │
+              │  writer 线程（响应+推送）  │
+              ├───────────────────────────┤
+              │  arm worker（每条总线一个）│
+              │   urgent 队列 64          │
+              │   normal 队列 256         │
+              │   每订阅者有界队列 32（丢帧）│
+              │   60Hz sync_read 合并       │
+              └──────────┬────────────────┘
+                         ▼
+              /dev/cu.usbmodem*（Dynamixel 总线，1Mbps）</div>
+    <ul>
+      <li><b>urgent(64)</b>：写寄存器 / 扭矩 / sync_write / 重连，每轮优先全清，写命令到总线延迟 ≤2ms。</li>
+      <li><b>normal(256)</b>：读快照、ping、改速率等，每轮最多 16 条，保证轮询不被饿死。</li>
+      <li><b>轮询合并</b>：一次 <code>sync_read</code> 读全部电机，结果写状态缓存；所有订阅者共享这次读数。</li>
+      <li><b>发布背压</b>：每个订阅者一个容量 32 的有界队列，满了丢帧并计数（<code>frames_dropped</code>），慢客户端不拖累总线。</li>
+      <li><b>订阅速率</b>：<code>rate_hz ≥ 54</code> 时直通（每个轮询帧都推）；更低频率按时间抽帧。</li>
+      <li><b>自愈</b>：连续 3 次读失败判掉线 → 每 <code>reconnect_sec</code>（默认 2s）重连；连接时 ping 全部电机握手。</li>
+      <li><b>单实例</b>：打开串口前先拿 <code>&lt;socket&gt;.lock</code>（File::try_lock）；启动时探测已有 socket，活的拒绝抢占、死的清理。</li>
+    </ul>
+  </section>
+
+  <section class="block" id="install">
+    <h2>安装部署</h2>
+    <h3>macOS（air.my）</h3>
+    <pre class="code"><code>./scripts/deploy-macos.sh     # 构建 → 安装 → codesign → 重启 LaunchAgent
+# macOS 26 坑：拷贝过的二进制会被 taskgated 以 &quot;Code Signature Invalid&quot; SIGKILL，
+# 脚本里的 codesign --force --sign - 是必须的。</code></pre>
+    <h3>ARM 下位机（Linux）</h3>
+    <pre class="code"><code># 交叉编译（macOS 上已装 zig + cargo-zigbuild + rustup targets）
+./scripts/build-arm.sh        # → dist/armd-aarch64, dist/armd-armv7
+# 板上安装
+sudo install -d /opt/armd /etc/armd
+sudo install -m755 armd /opt/armd/armd
+sudo install -m600 configs/koch-arm-board.json /etc/armd/config.json
+sudo install -m644 deploy/systemd/armd.service /etc/systemd/system/
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl enable --now armd
+sudo usermod -aG dialout armd
+sudo systemctl mask serial-getty@ttyS2   # Armbian 默认串口控制台会占用 UART
+sudo cat /run/armd/identity.json</code></pre>
+    <div class="warn">只有板上的 armd 能碰串口：下位机上线后，air.my 上不要再起 armd（或清空其 arms）。
+    网络场景必须配 <code>token</code>；不要裸奔在局域网。</div>
+  </section>
+
+  <section class="block" id="config">
+    <h2>配置参考（JSON）</h2>
+    <pre class="code"><code>{
+  &quot;socket&quot;: &quot;/tmp/armd.sock&quot;,
+  &quot;listen&quot;: [&quot;unix:/tmp/armd.sock&quot;, &quot;tcp://0.0.0.0:8771&quot;],
+  &quot;token&quot;: &quot;CHANGE_ME&quot;,
+  &quot;identity&quot;: &quot;/run/armd/identity.json&quot;,
+  &quot;arms&quot;: [
+    {
+      &quot;id&quot;: &quot;koch_v1_1:follower&quot;,
+      &quot;label&quot;: &quot;Koch v1.1 从臂&quot;,
+      &quot;port&quot;: &quot;/dev/ttyACM0&quot;,
+      &quot;baud&quot;: 1000000,
+      &quot;poll_hz&quot;: 60,
+      &quot;motors&quot;: [1, 2, 3, 4, 5, 6],
+      &quot;monitor&quot;: true,
+      &quot;joint_names&quot;: {&quot;1&quot;: &quot;shoulder_pan&quot;, &quot;2&quot;: &quot;shoulder_lift&quot;, &quot;3&quot;: &quot;elbow_flex&quot;,
+                       &quot;4&quot;: &quot;wrist_flex&quot;, &quot;5&quot;: &quot;wrist_roll&quot;, &quot;6&quot;: &quot;gripper&quot;},
+      &quot;profile&quot;: &quot;~/.config/armd/profiles/koch_v1_1-follower.json&quot;
+    }
+  ]
+}</code></pre>
+    <div class="table-wrap"><table><thead><tr><th>配置项</th><th>默认值</th><th>说明</th></tr></thead><tbody><tr><td><code>socket</code></td><td><code>/tmp/armd.sock</code></td><td>兼容字段：未配 listen 时等价 listen=[unix:&lt;socket&gt;]</td></tr><tr><td><code>listen</code></td><td><code>[]</code></td><td>监听地址数组：unix:&lt;path&gt; / tcp://host:port</td></tr><tr><td><code>token</code></td><td><code>null</code></td><td>可选访问令牌</td></tr><tr><td><code>identity</code></td><td><code>/tmp/armd-identity.json 或 /run/armd/identity.json</code></td><td>身份文件路径</td></tr><tr><td><code>arms[].id</code></td><td><code>—</code></td><td>对外 arm id，建议 &lt;robot&gt;:&lt;role&gt;</td></tr><tr><td><code>arms[].port</code></td><td><code>—</code></td><td>串口设备路径（sim=true 可空）</td></tr><tr><td><code>arms[].baud</code></td><td><code>1000000</code></td><td>波特率</td></tr><tr><td><code>arms[].poll_hz</code></td><td><code>60</code></td><td>轮询频率</td></tr><tr><td><code>arms[].motors</code></td><td><code>[1,2,3,4,5,6]</code></td><td>轮询的舵机 id</td></tr><tr><td><code>arms[].monitor</code></td><td><code>False</code></td><td>每秒读电压/温度（寄存器 144/146）</td></tr><tr><td><code>arms[].joint_names</code></td><td><code>{}</code></td><td>舵机 id→关节名，标定档案与角度换算必需</td></tr><tr><td><code>arms[].profile</code></td><td><code>~/.config/armd/profiles/&lt;arm-id&gt;.json</code></td><td>标定档案路径</td></tr><tr><td><code>arms[].sim</code></td><td><code>False</code></td><td>仿真臂</td></tr><tr><td><code>arms[].reconnect_sec</code></td><td><code>2.0</code></td><td>断线重连间隔</td></tr><tr><td><code>arms[].read_timeout_ms</code></td><td><code>30</code></td><td>单次 sync_read 超时</td></tr></tbody></table></div>
+  </section>
+
+  <section class="block" id="protocol">
+    <h2>传输与协议</h2>
+    <p><b>帧格式</b>：NDJSON：一行一个 JSON。请求/响应用 id 配对；推送帧带 event 字段、无 id。</p>
+    <p><b>Unix socket</b>：/tmp/armd.sock（macOS/Linux 本机；权限 0600）<br>
+       <b>TCP</b>：tcp://host:8771（下位机/网络场景，配置 listen 里开启）<br>
+       <b>鉴权</b>：配置 token 后，客户端必须先发 hello 带 token，否则所有方法返回 unauthorized。<br>
+       <b>JSON-RPC 2.0</b>：兼容 JSON-RPC 2.0：请求带 &quot;jsonrpc&quot;:&quot;2.0&quot; 时响应也带。</p>
+    <h3>请求 / 响应 / 错误</h3>
+    <pre class="code"><code>→ {&quot;id&quot;: 7, &quot;method&quot;: &quot;arm.state&quot;, &quot;params&quot;: {&quot;arm&quot;: &quot;koch_v1_1:follower&quot;}}</code></pre>
+    <pre class="code"><code>← {&quot;id&quot;: 7, &quot;result&quot;: {&quot;seq&quot;: 123, &quot;connected&quot;: true, &quot;joints&quot;: {&quot;1&quot;: 1511}, &quot;deg&quot;: {&quot;shoulder_pan&quot;: 43.24}}}</code></pre>
+    <pre class="code"><code>← {&quot;id&quot;: 7, &quot;error&quot;: {&quot;code&quot;: &quot;no_such_arm&quot;, &quot;message&quot;: &quot;unknown arm &#x27;x&#x27;&quot;}}</code></pre>
+    <p class="muted">请求不带 id 也可（单向命令），但写操作建议带 id 等确认。</p>
+  </section>
+
+  <section class="block" id="methods">
+    <h2>RPC 方法</h2>
+    <div class="table-wrap"><table><thead><tr><th>方法</th><th>说明</th></tr></thead><tbody><tr><td><a href="#m-ping"><code>ping</code></a></td><td>健康检查。</td></tr><tr><td><a href="#m-hello"><code>hello</code></a></td><td>鉴权握手（配置了 token 时必需）。</td></tr><tr><td><a href="#m-info"><code>info</code></a></td><td>守护进程信息。</td></tr><tr><td><a href="#m-arm-list"><code>arm.list</code></a></td><td>所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/stats。</td></tr><tr><td><a href="#m-arm-state"><code>arm.state</code></a></td><td>读状态缓存，不占总线。deg 只在有 profile 时出现。</td></tr><tr><td><a href="#m-arm-read"><code>arm.read</code></a></td><td>立刻 sync_read 一次（占用总线），用于即时取值/标定采点。</td></tr><tr><td><a href="#m-arm-read_register"><code>arm.read_register</code></a></td><td>读任意控制表寄存器（小端有符号解析）。</td></tr><tr><td><a href="#m-arm-write_register"><code>arm.write_register</code></a></td><td>写任意寄存器（等舵机状态包确认）。</td></tr><tr><td><a href="#m-arm-sync_write"><code>arm.sync_write</code></a></td><td>同步写多个舵机（广播式，不等回包）。</td></tr><tr><td><a href="#m-arm-torque"><code>arm.torque</code></a></td><td>扭矩开关（写 Torque_Enable=64）。</td></tr><tr><td><a href="#m-arm-ping"><code>arm.ping</code></a></td><td>单舵机 ping，返回 model number。</td></tr><tr><td><a href="#m-arm-set_rate"><code>arm.set_rate</code></a></td><td>改轮询频率。</td></tr><tr><td><a href="#m-arm-reconnect"><code>arm.reconnect</code></a></td><td>强制重开串口（排查用）。</td></tr><tr><td><a href="#m-arm-stats"><code>arm.stats</code></a></td><td>计数器。</td></tr><tr><td><a href="#m-arm-profile-get"><code>arm.profile.get</code></a></td><td>读取标定档案。</td></tr><tr><td><a href="#m-arm-profile-set"><code>arm.profile.set</code></a></td><td>校验并持久化档案（覆盖前自动留历史快照）。</td></tr><tr><td><a href="#m-arm-profile-history"><code>arm.profile.history</code></a></td><td>历史快照列表（保留最近 20 份）。</td></tr><tr><td><a href="#m-arm-profile-restore"><code>arm.profile.restore</code></a></td><td>从历史快照恢复。</td></tr><tr><td><a href="#m-arm-profile-delete"><code>arm.profile.delete</code></a></td><td>删除档案。</td></tr><tr><td><a href="#m-arm-calibration-snapshot"><code>arm.calibration.snapshot</code></a></td><td>标定采点用：当前 raw（按关节名）+角度+健康，不占总线。</td></tr><tr><td><a href="#m-sub-subscribe"><code>sub.subscribe</code></a></td><td>订阅状态流。rate&gt;=54 时直通每个轮询帧；更低频率按时间抽帧。</td></tr><tr><td><a href="#m-sub-unsubscribe"><code>sub.unsubscribe</code></a></td><td>退订。</td></tr><tr><td><a href="#m-sub-rate"><code>sub.rate</code></a></td><td>改订阅频率。</td></tr></tbody></table></div>
+    
+<section class="method" id="m-ping">
+  <h3><code>ping</code></h3>
+  <p>健康检查。</p>
+  <h4>参数</h4>
+  <p class="muted">无</p>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;pong&quot;: &quot;bool&quot;,
+  &quot;version&quot;: &quot;str&quot;,
+  &quot;uptime_sec&quot;: &quot;int&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-hello">
+  <h3><code>hello</code></h3>
+  <p>鉴权握手（配置了 token 时必需）。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>token</code></td><td>str · 可选</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;auth_required&quot;: &quot;bool&quot;,
+  &quot;version&quot;: &quot;str&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-info">
+  <h3><code>info</code></h3>
+  <p>守护进程信息。</p>
+  <h4>参数</h4>
+  <p class="muted">无</p>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;version&quot;: &quot;str&quot;,
+  &quot;uptime_sec&quot;: &quot;int&quot;,
+  &quot;socket&quot;: &quot;str&quot;,
+  &quot;arms&quot;: &quot;[str]&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-list">
+  <h3><code>arm.list</code></h3>
+  <p>所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/stats。</p>
+  <h4>参数</h4>
+  <p class="muted">无</p>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;[arm]&quot;: &quot;见 arm.state&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-state">
+  <h3><code>arm.state</code></h3>
+  <p>读状态缓存，不占总线。deg 只在有 profile 时出现。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;seq&quot;: &quot;int&quot;,
+  &quot;ts&quot;: &quot;int ms&quot;,
+  &quot;connected&quot;: &quot;bool&quot;,
+  &quot;joints&quot;: &quot;{motor_id: raw}&quot;,
+  &quot;deg&quot;: &quot;{joint: deg}&quot;,
+  &quot;joint_names&quot;: &quot;{motor_id: joint}&quot;,
+  &quot;health&quot;: &quot;{motor_id: {voltage, temp}}&quot;,
+  &quot;hz&quot;: &quot;float&quot;,
+  &quot;read_us&quot;: &quot;int&quot;,
+  &quot;error&quot;: &quot;str|null&quot;,
+  &quot;profile_saved_at&quot;: &quot;int|null&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-read">
+  <h3><code>arm.read</code></h3>
+  <p>立刻 sync_read 一次（占用总线），用于即时取值/标定采点。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motors</code></td><td>[u8] · 可选</td></tr><tr><td><code>timeout_ms</code></td><td>int · 可选 · 默认 50</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;positions&quot;: &quot;{motor_id: raw}&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-read_register">
+  <h3><code>arm.read_register</code></h3>
+  <p>读任意控制表寄存器（小端有符号解析）。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motor</code></td><td>u8</td></tr><tr><td><code>address</code></td><td>u16</td></tr><tr><td><code>length</code></td><td>u16</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;data&quot;: &quot;[u8]&quot;,
+  &quot;value&quot;: &quot;int&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-write_register">
+  <h3><code>arm.write_register</code></h3>
+  <p>写任意寄存器（等舵机状态包确认）。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motor</code></td><td>u8</td></tr><tr><td><code>address</code></td><td>u16</td></tr><tr><td><code>length</code></td><td>u16</td></tr><tr><td><code>value</code></td><td>int</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-sync_write">
+  <h3><code>arm.sync_write</code></h3>
+  <p>同步写多个舵机（广播式，不等回包）。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>address</code></td><td>u16</td></tr><tr><td><code>length</code></td><td>u16</td></tr><tr><td><code>values</code></td><td>{motor_id: value}</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-torque">
+  <h3><code>arm.torque</code></h3>
+  <p>扭矩开关（写 Torque_Enable=64）。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>enable</code></td><td>bool</td></tr><tr><td><code>motors</code></td><td>[u8] · 可选</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-ping">
+  <h3><code>arm.ping</code></h3>
+  <p>单舵机 ping，返回 model number。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motor</code></td><td>u8</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;model&quot;: &quot;int&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-set_rate">
+  <h3><code>arm.set_rate</code></h3>
+  <p>改轮询频率。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>hz</code></td><td>float (0.5~500)</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;hz&quot;: &quot;float&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-reconnect">
+  <h3><code>arm.reconnect</code></h3>
+  <p>强制重开串口（排查用）。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-stats">
+  <h3><code>arm.stats</code></h3>
+  <p>计数器。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;polls&quot;: &quot;int&quot;,
+  &quot;read_errors&quot;: &quot;int&quot;,
+  &quot;writes&quot;: &quot;int&quot;,
+  &quot;frames_published&quot;: &quot;int&quot;,
+  &quot;frames_dropped&quot;: &quot;int&quot;,
+  &quot;reconnects&quot;: &quot;int&quot;,
+  &quot;urgent_queued&quot;: &quot;int&quot;,
+  &quot;normal_queued&quot;: &quot;int&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-profile-get">
+  <h3><code>arm.profile.get</code></h3>
+  <p>读取标定档案。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;profile&quot;: &quot;profile|null&quot;,
+  &quot;path&quot;: &quot;str&quot;,
+  &quot;has_profile&quot;: &quot;bool&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-profile-set">
+  <h3><code>arm.profile.set</code></h3>
+  <p>校验并持久化档案（覆盖前自动留历史快照）。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>profile</code></td><td>profile</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;profile&quot;: &quot;profile&quot;,
+  &quot;path&quot;: &quot;str&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-profile-history">
+  <h3><code>arm.profile.history</code></h3>
+  <p>历史快照列表（保留最近 20 份）。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;history&quot;: &quot;[{name, savedAt}]&quot;,
+  &quot;dir&quot;: &quot;str&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-profile-restore">
+  <h3><code>arm.profile.restore</code></h3>
+  <p>从历史快照恢复。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>name</code></td><td>str</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;restored&quot;: &quot;str&quot;,
+  &quot;profile&quot;: &quot;profile&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-profile-delete">
+  <h3><code>arm.profile.delete</code></h3>
+  <p>删除档案。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;deleted&quot;: &quot;bool&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-calibration-snapshot">
+  <h3><code>arm.calibration.snapshot</code></h3>
+  <p>标定采点用：当前 raw（按关节名）+角度+健康，不占总线。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;raw&quot;: &quot;{joint: raw}&quot;,
+  &quot;deg&quot;: &quot;{joint: deg}&quot;,
+  &quot;seq&quot;: &quot;int&quot;,
+  &quot;ts&quot;: &quot;int&quot;,
+  &quot;connected&quot;: &quot;bool&quot;,
+  &quot;health&quot;: &quot;{motor_id: {voltage, temp}}&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-sub-subscribe">
+  <h3><code>sub.subscribe</code></h3>
+  <p>订阅状态流。rate&gt;=54 时直通每个轮询帧；更低频率按时间抽帧。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arms</code></td><td>[str] · 可选</td></tr><tr><td><code>rate_hz</code></td><td>float · 可选 · 默认 60</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;sub_id&quot;: &quot;int&quot;,
+  &quot;rate_hz&quot;: &quot;float&quot;,
+  &quot;arms&quot;: &quot;[str]&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-sub-unsubscribe">
+  <h3><code>sub.unsubscribe</code></h3>
+  <p>退订。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>sub_id</code></td><td>int</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-sub-rate">
+  <h3><code>sub.rate</code></h3>
+  <p>改订阅频率。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>sub_id</code></td><td>int</td></tr><tr><td><code>rate_hz</code></td><td>float</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;
+}</code></pre>
+</section>
+  </section>
+
+  <section class="block" id="events">
+    <h2>发布订阅（事件帧）</h2>
+    <p>订阅后服务端按 <code>rate_hz</code> 推送；帧里 <code>sub</code> 是订阅 id。
+    <code>event:"state"</code> 为周期状态，<code>event:"arm"</code> 为连接状态变化。</p>
+    <section class="event"><h3><code>state</code></h3>
+    <p>周期状态帧。</p><pre class="code"><code>{
+  &quot;event&quot;: &quot;\&quot;state\&quot;&quot;,
+  &quot;sub&quot;: &quot;int&quot;,
+  &quot;arm&quot;: &quot;str&quot;,
+  &quot;seq&quot;: &quot;int&quot;,
+  &quot;ts&quot;: &quot;int ms&quot;,
+  &quot;connected&quot;: &quot;bool&quot;,
+  &quot;hz&quot;: &quot;float&quot;,
+  &quot;joints&quot;: &quot;{motor_id: raw}&quot;,
+  &quot;deg&quot;: &quot;{joint: deg}&quot;,
+  &quot;health&quot;: &quot;{motor_id: {voltage, temp}}&quot;
+}</code></pre></section><section class="event"><h3><code>arm</code></h3>
+    <p>连接状态变化事件（掉线/恢复）。</p><pre class="code"><code>{
+  &quot;event&quot;: &quot;\&quot;arm\&quot;&quot;,
+  &quot;sub&quot;: &quot;int&quot;,
+  &quot;arm&quot;: &quot;str&quot;,
+  &quot;connected&quot;: &quot;bool&quot;,
+  &quot;error&quot;: &quot;str|null&quot;,
+  &quot;ts&quot;: &quot;int ms&quot;
+}</code></pre></section>
+  </section>
+
+  <section class="block" id="profile">
+    <h2>标定档案 profile</h2>
+    <p>标定档案：raw→URDF 关节角的换算参数。存在 ~/.config/armd/profiles/&lt;arm-id&gt;.json。</p>
+    <div class="table-wrap"><table><thead><tr><th>字段</th><th>含义</th></tr></thead><tbody><tr><td><code>zero</code></td><td><code>{joint: raw}</code></td></tr><tr><td><code>sign</code></td><td><code>{joint: 1|-1}</code></td></tr><tr><td><code>grip</code></td><td><code>open</code>：int<br><code>closed</code>：int<br><code>angle</code>：float (5~140.5, 可选)</td></tr><tr><td><code>spin</code></td><td><code>wrist_roll</code>：float (-180~180, 可选)</td></tr><tr><td><code>savedAt</code></td><td><code>int (unix 秒)</code></td></tr></tbody></table></div>
+    <h3>换算公式</h3>
+    <pre class="code"><code># 非夹爪关节
+deg = wrap(raw - zero)   # 折到 ±2048（连续关节可整圈，避免 ±180° 跳变）
+deg = deg * 360 / 4096 * sign
+# 夹爪
+deg = clamp((raw - closed) / (open - closed), 0, 1) * (angle 或 137.5)</code></pre>
+    <h3>读写 / 历史 / 恢复</h3>
+    <pre class="code"><code>c.profile(arm) -&gt; {profile, path, has_profile}
+c.set_profile(arm, profile)     # 校验 + 原子写；覆盖前自动快照到 profiles/history/（保留 20 份）
+c.profile_history(arm)          # [{name, savedAt}]
+c.restore_profile(arm, name)    # 从历史快照恢复
+c.calibration_snapshot(arm)     # 采点：raw(按关节名)+deg+health，不占总线</code></pre>
+    <div class="note">armd 是标定数据的<b>唯一事实源</b>。ZeroPose 的「保存到真机」通过
+    <code>arm.profile.set</code> 写入；本地 <code>~/.config/zeropose/*.json</code> 只是镜像备份。</div>
+  </section>
+
+  <section class="block" id="clients">
+    <h2>客户端与示例</h2>
+    <p><b>Python 客户端</b>：<code>clients/python/armd_client.py</code>（纯标准库，支持 Unix/TCP/token）。</p>
+    <pre class="code"><code>from armd_client import ArmdClient  # clients/python/armd_client.py（stdlib）
+
+c = ArmdClient(&quot;/tmp/armd.sock&quot;, token=None)      # 下位机：ArmdClient(&quot;tcp://arm-board:8771&quot;, token=...)
+print(c.arms())                                    # 所有机械臂摘要
+print(c.state(&quot;koch_v1_1:follower&quot;)[&quot;deg&quot;])        # 标定后的关节角（度）
+print(c.read(&quot;koch_v1_1:follower&quot;)[&quot;positions&quot;])   # 立刻 sync_read 一次 raw
+
+# 订阅 60Hz 状态流
+import time
+frames = []
+sub = c.subscribe(lambda f: frames.append(f), arms=[&quot;koch_v1_1:follower&quot;], rate_hz=60)
+time.sleep(1)
+print(&quot;frames/s ≈&quot;, len(frames))
+c.unsubscribe(sub)
+
+# 标定档案
+prof = c.profile(&quot;koch_v1_1:follower&quot;)[&quot;profile&quot;]
+c.set_profile(&quot;koch_v1_1:follower&quot;, prof)          # 覆盖前 armd 自动留历史
+print(c.profile_history(&quot;koch_v1_1:follower&quot;)[&quot;history&quot;])
+c.restore_profile(&quot;koch_v1_1:follower&quot;, c.profile_history(&quot;koch_v1_1:follower&quot;)[&quot;history&quot;][-1][&quot;name&quot;])
+c.close()</code></pre>
+    <h3>裸 socket（任意语言）</h3>
+    <pre class="code"><code># 带 token 时先 hello；下面是 raw socket 写法（也可以用 socat/nc）
+python3 - &lt;&lt;&#x27;PY&#x27;
+import json, socket
+s = socket.socket(socket.AF_UNIX); s.connect(&quot;/tmp/armd.sock&quot;)
+s.sendall((json.dumps({&quot;id&quot;:1,&quot;method&quot;:&quot;hello&quot;,&quot;params&quot;:{&quot;token&quot;:&quot;&lt;TOKEN&gt;&quot;}})+&quot;\n&quot;).encode())
+print(s.recv(4096).decode().strip())
+s.sendall((json.dumps({&quot;id&quot;:2,&quot;method&quot;:&quot;arm.state&quot;,&quot;params&quot;:{&quot;arm&quot;:&quot;koch_v1_1:follower&quot;}})+&quot;\n&quot;).encode())
+print(s.recv(65536).decode().strip())
+PY</code></pre>
+    <h3>CLI</h3>
+    <pre class="code"><code>python3 clients/python/armd_client.py --socket /tmp/armd.sock info
+python3 clients/python/armd_client.py --socket /tmp/armd.sock arms
+python3 clients/python/armd_client.py --socket /tmp/armd.sock state   koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd.sock read    koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd.sock stats   koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd.sock watch   koch_v1_1:follower --rate 10
+python3 clients/python/armd_client.py --socket /tmp/armd.sock torque  koch_v1_1:follower 0
+python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:follower --history
+python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1:follower</code></pre>
+  </section>
+
+  <section class="block" id="errors">
+    <h2>错误码</h2>
+    <div class="table-wrap"><table><thead><tr><th>错误码</th><th>含义</th></tr></thead><tbody><tr><td><code>bad_request</code></td><td>参数缺失/类型错误/校验失败</td></tr><tr><td><code>no_such_arm</code></td><td>arm id 不存在（可用 arm.list 查询）</td></tr><tr><td><code>no_such_sub</code></td><td>订阅 id 不存在</td></tr><tr><td><code>unknown_method</code></td><td>未知方法</td></tr><tr><td><code>queue_full</code></td><td>urgent/normal 队列满，客户端应退避重试</td></tr><tr><td><code>timeout</code></td><td>worker 未在期限内回复（总线可能卡住）</td></tr><tr><td><code>serial_error</code></td><td>串口/舵机错误（含舵机硬件 error 位）</td></tr><tr><td><code>io_error</code></td><td>本地文件读写失败（如 profile 写入）</td></tr><tr><td><code>unauthorized</code></td><td>已配置 token，但连接未先 hello</td></tr><tr><td><code>closed</code></td><td>客户端已关闭（客户端侧错误）</td></tr></tbody></table></div>
+  </section>
+
+  <section class="block" id="faq">
+    <h2>排障 FAQ</h2>
+    <h3>启动失败：另一个 armd 已经持有 …lock</h3>
+    <p>单实例锁 <code>&lt;socket&gt;.lock</code> 被占用。先确认没有在跑的 armd（<code>pgrep -fl armd</code>）；
+    锁文件本身不需要删除（进程退出内核自动释放）。</p>
+    <h3>macOS：进程刚起就被 SIGKILL（Code Signature Invalid）</h3>
+    <p>拷贝过的二进制需要重签：<code>codesign --force --sign - ~/.local/bin/armd</code>；用 <code>scripts/deploy-macos.sh</code> 可避免。</p>
+    <h3>Linux 板子：舵机全都不响应</h3>
+    <p>99% 是串口被别的程序占用：<code>lsof /dev/ttyACM0</code> 或 <code>fuser -v /dev/ttyACM0</code>；
+    Armbian 常见 <code>serial-getty@ttyS2</code>，<code>sudo systemctl mask serial-getty@ttyS2</code>。</p>
+    <h3>连接被拒 / 全部 unauthorized</h3>
+    <p>配置了 <code>token</code>：客户端连接后必须先发 <code>hello</code>（Python 客户端传 <code>token=</code> 或环境变量 <code>ARMD_TOKEN</code> 会自动发）。</p>
+    <h3>订阅帧数比 60 少</h3>
+    <p><code>rate_hz &lt; 54</code> 会按时间抽帧；要 60Hz 直通就传 <code>rate_hz: 60</code>。
+    也可能是客户端读得慢：看 <code>arm.stats.frames_dropped</code>。</p>
+    <h3>网页/应用一直显示旧数据</h3>
+    <p>检查订阅连接是否中断：状态帧 <code>ts</code> 超过 1 秒没更新应视为掉线并重连（ZeroPose 已内置）。
+    armd 重启后客户端需要重新 subscribe。</p>
+    <h3>谁在跑？什么版本？监听在哪？</h3>
+    <p><code>cat /tmp/armd-identity.json</code>（Linux 下是 <code>/run/armd/identity.json</code>）。</p>
+  </section>
+
+  <section class="block" id="changelog">
+    <h2>版本与兼容</h2>
+    <ul>
+      <li><b>v0.1.0</b>（2026-11-22）：JSON-RPC 2.0 兼容、token 鉴权、Unix+TCP 双传输、
+      标定档案 profile + 历史快照/恢复、电压/温度监控、ARM 交叉编译产物。</li>
+      <li>协议稳定性：方法名/字段只增不改；新增可选字段老客户端可忽略。</li>
+      <li>机器可读规范：<code>docs/api.json</code>（本页由它生成：<code>python3 scripts/gen-armd-doc.py</code>）。</li>
+    </ul>
+    <footer>armd v0.1.0 · 生成于 2026-11-22 21:30 ·
+    仓库 Gogs <code>adam/armd</code> / GitHub <code>ColdZoo/armd</code></footer>
+  </section>
+</main>
+</div>
+<script type="application/json" id="armd-api">{"name": "armd", "version": "0.1.0", "updated": "2026-11-22", "summary": "Dynamixel 机械臂串口守护进程：独占串口总线，对上层提供 NDJSON RPC 与发布订阅；持有标定档案（profile）。", "transport": {"unix": "/tmp/armd.sock（macOS/Linux 本机；权限 0600）", "tcp": "tcp://host:8771（下位机/网络场景，配置 listen 里开启）", "framing": "NDJSON：一行一个 JSON。请求/响应用 id 配对；推送帧带 event 字段、无 id。", "auth": "配置 token 后，客户端必须先发 hello 带 token，否则所有方法返回 unauthorized。", "jsonrpc": "兼容 JSON-RPC 2.0：请求带 \"jsonrpc\":\"2.0\" 时响应也带。"}, "request_example": {"id": 7, "method": "arm.state", "params": {"arm": "koch_v1_1:follower"}}, "response_example": {"id": 7, "result": {"seq": 123, "connected": true, "joints": {"1": 1511}, "deg": {"shoulder_pan": 43.24}}}, "error_example": {"id": 7, "error": {"code": "no_such_arm", "message": "unknown arm 'x'"}}, "errors": [{"code": "bad_request", "meaning": "参数缺失/类型错误/校验失败"}, {"code": "no_such_arm", "meaning": "arm id 不存在（可用 arm.list 查询）"}, {"code": "no_such_sub", "meaning": "订阅 id 不存在"}, {"code": "unknown_method", "meaning": "未知方法"}, {"code": "queue_full", "meaning": "urgent/normal 队列满，客户端应退避重试"}, {"code": "timeout", "meaning": "worker 未在期限内回复（总线可能卡住）"}, {"code": "serial_error", "meaning": "串口/舵机错误（含舵机硬件 error 位）"}, {"code": "io_error", "meaning": "本地文件读写失败（如 profile 写入）"}, {"code": "unauthorized", "meaning": "已配置 token，但连接未先 hello"}, {"code": "closed", "meaning": "客户端已关闭（客户端侧错误）"}], "methods": [{"name": "ping", "params": [], "result": {"pong": "bool", "version": "str", "uptime_sec": "int"}, "desc": "健康检查。"}, {"name": "hello", "params": [{"name": "token", "type": "str", "optional": true}], "result": {"ok": "bool", "auth_required": "bool", "version": "str"}, "desc": "鉴权握手（配置了 token 时必需）。"}, {"name": "info", "params": [], "result": {"version": "str", "uptime_sec": "int", "socket": "str", "arms": "[str]"}, "desc": "守护进程信息。"}, {"name": "arm.list", "params": [], "result": {"[arm]": "见 arm.state"}, "desc": "所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/stats。"}, {"name": "arm.state", "params": [{"name": "arm", "type": "str"}], "result": {"seq": "int", "ts": "int ms", "connected": "bool", "joints": "{motor_id: raw}", "deg": "{joint: deg}", "joint_names": "{motor_id: joint}", "health": "{motor_id: {voltage, temp}}", "hz": "float", "read_us": "int", "error": "str|null", "profile_saved_at": "int|null"}, "desc": "读状态缓存，不占总线。deg 只在有 profile 时出现。"}, {"name": "arm.read", "params": [{"name": "arm", "type": "str"}, {"name": "motors", "type": "[u8]", "optional": true}, {"name": "timeout_ms", "type": "int", "optional": true, "default": 50}], "result": {"positions": "{motor_id: raw}"}, "desc": "立刻 sync_read 一次（占用总线），用于即时取值/标定采点。"}, {"name": "arm.read_register", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}], "result": {"data": "[u8]", "value": "int"}, "desc": "读任意控制表寄存器（小端有符号解析）。"}, {"name": "arm.write_register", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}, {"name": "value", "type": "int"}], "result": {"ok": "bool"}, "desc": "写任意寄存器（等舵机状态包确认）。"}, {"name": "arm.sync_write", "params": [{"name": "arm", "type": "str"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}, {"name": "values", "type": "{motor_id: value}"}], "result": {"ok": "bool"}, "desc": "同步写多个舵机（广播式，不等回包）。"}, {"name": "arm.torque", "params": [{"name": "arm", "type": "str"}, {"name": "enable", "type": "bool"}, {"name": "motors", "type": "[u8]", "optional": true}], "result": {"ok": "bool"}, "desc": "扭矩开关（写 Torque_Enable=64）。"}, {"name": "arm.ping", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}], "result": {"model": "int"}, "desc": "单舵机 ping，返回 model number。"}, {"name": "arm.set_rate", "params": [{"name": "arm", "type": "str"}, {"name": "hz", "type": "float (0.5~500)"}], "result": {"ok": "bool", "hz": "float"}, "desc": "改轮询频率。"}, {"name": "arm.reconnect", "params": [{"name": "arm", "type": "str"}], "result": {"ok": "bool"}, "desc": "强制重开串口（排查用）。"}, {"name": "arm.stats", "params": [{"name": "arm", "type": "str"}], "result": {"polls": "int", "read_errors": "int", "writes": "int", "frames_published": "int", "frames_dropped": "int", "reconnects": "int", "urgent_queued": "int", "normal_queued": "int"}, "desc": "计数器。"}, {"name": "arm.profile.get", "params": [{"name": "arm", "type": "str"}], "result": {"profile": "profile|null", "path": "str", "has_profile": "bool"}, "desc": "读取标定档案。"}, {"name": "arm.profile.set", "params": [{"name": "arm", "type": "str"}, {"name": "profile", "type": "profile"}], "result": {"profile": "profile", "path": "str"}, "desc": "校验并持久化档案（覆盖前自动留历史快照）。"}, {"name": "arm.profile.history", "params": [{"name": "arm", "type": "str"}], "result": {"history": "[{name, savedAt}]", "dir": "str"}, "desc": "历史快照列表（保留最近 20 份）。"}, {"name": "arm.profile.restore", "params": [{"name": "arm", "type": "str"}, {"name": "name", "type": "str"}], "result": {"restored": "str", "profile": "profile"}, "desc": "从历史快照恢复。"}, {"name": "arm.profile.delete", "params": [{"name": "arm", "type": "str"}], "result": {"deleted": "bool"}, "desc": "删除档案。"}, {"name": "arm.calibration.snapshot", "params": [{"name": "arm", "type": "str"}], "result": {"raw": "{joint: raw}", "deg": "{joint: deg}", "seq": "int", "ts": "int", "connected": "bool", "health": "{motor_id: {voltage, temp}}"}, "desc": "标定采点用：当前 raw（按关节名）+角度+健康，不占总线。"}, {"name": "sub.subscribe", "params": [{"name": "arms", "type": "[str]", "optional": true}, {"name": "rate_hz", "type": "float", "optional": true, "default": 60}], "result": {"sub_id": "int", "rate_hz": "float", "arms": "[str]"}, "desc": "订阅状态流。rate>=54 时直通每个轮询帧；更低频率按时间抽帧。"}, {"name": "sub.unsubscribe", "params": [{"name": "sub_id", "type": "int"}], "result": {"ok": "bool"}, "desc": "退订。"}, {"name": "sub.rate", "params": [{"name": "sub_id", "type": "int"}, {"name": "rate_hz", "type": "float"}], "result": {"ok": "bool"}, "desc": "改订阅频率。"}], "events": [{"event": "state", "fields": {"event": "\"state\"", "sub": "int", "arm": "str", "seq": "int", "ts": "int ms", "connected": "bool", "hz": "float", "joints": "{motor_id: raw}", "deg": "{joint: deg}", "health": "{motor_id: {voltage, temp}}"}, "desc": "周期状态帧。"}, {"event": "arm", "fields": {"event": "\"arm\"", "sub": "int", "arm": "str", "connected": "bool", "error": "str|null", "ts": "int ms"}, "desc": "连接状态变化事件（掉线/恢复）。"}], "profile_schema": {"description": "标定档案：raw→URDF 关节角的换算参数。存在 ~/.config/armd/profiles/<arm-id>.json。", "fields": {"zero": "{joint: raw}", "sign": "{joint: 1|-1}", "grip": {"open": "int", "closed": "int", "angle": "float (5~140.5, 可选)"}, "spin": {"wrist_roll": "float (-180~180, 可选)"}, "savedAt": "int (unix 秒)"}, "formula": "非夹爪关节：deg = wrap(raw - zero) % 4096（折到 ±2048）× 360/4096 × sign；夹爪：deg = clamp((raw - closed)/(open - closed), 0, 1) × (angle 或 137.5)"}, "config_fields": [{"key": "socket", "default": "/tmp/armd.sock", "desc": "兼容字段：未配 listen 时等价 listen=[unix:<socket>]"}, {"key": "listen", "default": "[]", "desc": "监听地址数组：unix:<path> / tcp://host:port"}, {"key": "token", "default": "null", "desc": "可选访问令牌"}, {"key": "identity", "default": "/tmp/armd-identity.json 或 /run/armd/identity.json", "desc": "身份文件路径"}, {"key": "arms[].id", "desc": "对外 arm id，建议 <robot>:<role>"}, {"key": "arms[].port", "desc": "串口设备路径（sim=true 可空）"}, {"key": "arms[].baud", "default": 1000000, "desc": "波特率"}, {"key": "arms[].poll_hz", "default": 60, "desc": "轮询频率"}, {"key": "arms[].motors", "default": "[1,2,3,4,5,6]", "desc": "轮询的舵机 id"}, {"key": "arms[].monitor", "default": false, "desc": "每秒读电压/温度（寄存器 144/146）"}, {"key": "arms[].joint_names", "default": "{}", "desc": "舵机 id→关节名，标定档案与角度换算必需"}, {"key": "arms[].profile", "default": "~/.config/armd/profiles/<arm-id>.json", "desc": "标定档案路径"}, {"key": "arms[].sim", "default": false, "desc": "仿真臂"}, {"key": "arms[].reconnect_sec", "default": 2.0, "desc": "断线重连间隔"}, {"key": "arms[].read_timeout_ms", "default": 30, "desc": "单次 sync_read 超时"}], "packages": {"repo": "Gogs adam/armd, GitHub ColdZoo/armd, 本地 /raid/Projects/armd", "python_client": "clients/python/armd_client.py（纯标准库）", "cli": "python3 clients/python/armd_client.py --socket /tmp/armd.sock <info|arms|state|read|stats|watch|torque|write|profile|snapshot>"}}</script>
+<script>
+  // 侧边栏 TOC 高亮
+  const links = [...document.querySelectorAll('.toc a')];
+  const targets = links.map(a => document.querySelector(a.getAttribute('href'))).filter(Boolean);
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(en => {
+      if (en.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        const link = links.find(l => l.getAttribute('href') === '#' + en.target.id);
+        if (link) link.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  targets.forEach(t => io.observe(t));
+
+  // 搜索：过滤方法/事件/错误码/配置表行，并隐藏无匹配的区块标题
+  const search = document.getElementById('search');
+  search.addEventListener('input', () => {
+    const q = search.value.trim().toLowerCase();
+    document.querySelectorAll('section.method, section.event, tbody tr').forEach(el => {
+      el.style.display = !q || el.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+    document.querySelectorAll('section.method').forEach(el => {
+      const h3 = el.querySelector('h3');
+      if (h3 && el.style.display === 'none') h3.dataset.hidden = '1';
+    });
+  });
+</script>
+</body>
+</html>
