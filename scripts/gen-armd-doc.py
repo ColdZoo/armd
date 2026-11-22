@@ -104,6 +104,54 @@ profile_fields = table(
     ],
 )
 
+SAFETY = API["safety"]
+
+safety_guardrails = table(
+    ["防线", "触发条件", "动作", "如何观察/验收", "默认值"],
+    [
+        (
+            f"<b>{esc(g['name'])}</b>",
+            esc(g["trigger"]),
+            esc(g["action"]),
+            esc(g["observe"]),
+            f"<code>{esc(g['defaults'])}</code>",
+        )
+        for g in SAFETY["guardrails"]
+    ],
+)
+
+safety_flows = "".join(
+    f'<h3>{esc(f["title"])}</h3>\n    <ol>'
+    + "".join(f"<li>{esc(s)}</li>" for s in f["steps"])
+    + "</ol>"
+    for f in SAFETY["recovery_flows"]
+)
+
+safety_bits = table(
+    ["位", "名称", "含义"],
+    [
+        (f"<code>{esc(b['mask'])}</code>", f"<code>{esc(b['name'])}</code>", esc(b["meaning"]))
+        for b in SAFETY["hardware_error_bits"]
+    ],
+)
+
+safety_defaults = table(
+    ["配置项", "默认", "含义"],
+    [
+        (f"<code>{esc(d['field'])}</code>", f"<code>{esc(d['default'])}</code>", esc(d["meaning"]))
+        for d in SAFETY["defaults"]
+    ],
+)
+
+safety_notes = "".join(f"<li>{esc(n)}</li>" for n in SAFETY["notes"])
+
+changelog_html = "".join(
+    f'<li><b>v{esc(c["version"])}</b>（{esc(c["date"])}）：'
+    + "；".join(esc(i) for i in c["items"])
+    + "。</li>"
+    for c in API.get("changelog", [])
+)
+
 PY_EXAMPLE = '''from armd_client import ArmdClient  # clients/python/armd_client.py（stdlib）
 
 c = ArmdClient("/tmp/armd.sock", token=None)      # 下位机：ArmdClient("tcp://arm-board:8771", token=...)
@@ -118,6 +166,14 @@ sub = c.subscribe(lambda f: frames.append(f), arms=["koch_v1_1:follower"], rate_
 time.sleep(1)
 print("frames/s ≈", len(frames))
 c.unsubscribe(sub)
+
+# 安全层（v0.2.0）
+print(c.safety("koch_v1_1:follower"))               # stalls / motor_errors / torque / limits / goals / safety
+print(c.state("koch_v1_1:follower")["motor_errors"])
+c.torque_off("koch_v1_1:follower")                  # 应急卸力矩（可传 motors=[3]）
+c.reboot("koch_v1_1:follower", motors=[3])          # Dynamixel Reboot(0x08) 清 latched 0x80
+c.clear_error("koch_v1_1:follower")                 # 清 armd 侧 error/stall 标记
+# c.sim_inject("koch_v1_1:follower", "stall", motors=[3])  # 仅 sim 臂：stall/hardware_error/no_response/clear
 
 # 标定档案
 prof = c.profile("koch_v1_1:follower")["profile"]
@@ -141,6 +197,7 @@ TOC = """
   <li><a href="#overview">概览</a></li>
   <li><a href="#quickstart">快速开始</a></li>
   <li><a href="#architecture">架构与队列</a></li>
+  <li><a href="#safety">安全层</a></li>
   <li><a href="#install">安装部署</a></li>
   <li><a href="#config">配置参考</a></li>
   <li><a href="#protocol">传输与协议</a></li>
@@ -256,6 +313,7 @@ HTML = f'''<!DOCTYPE html>
       <div class="card"><b>单进程多臂</b><br>一条总线一个 worker 线程；主臂/从臂可同时在线</div>
       <div class="card"><b>RPC + 发布订阅</b><br>Unix socket / TCP 上的 NDJSON；任意语言可接</div>
       <div class="card"><b>标定档案</b><br>zero/sign/grip 由 armd 持有，自动历史快照可恢复</div>
+      <div class="card"><b>安全层</b><br>堵转保护 + 软限位 + 单电机故障隔离（v0.2.0）</div>
       <div class="card"><b>ARM 下位机</b><br>交叉编译 aarch64/armv7，systemd + TCP + token</div>
     </div>
     <div class="note">快速判断"该不该用 armd"：只要你的程序需要读/写机械臂舵机，就应该连 armd；
@@ -309,9 +367,25 @@ python3 clients/python/armd_client.py --socket tcp://arm-board.my:8771 --token $
       <li><b>轮询合并</b>：一次 <code>sync_read</code> 读全部电机，结果写状态缓存；所有订阅者共享这次读数。</li>
       <li><b>发布背压</b>：每个订阅者一个容量 32 的有界队列，满了丢帧并计数（<code>frames_dropped</code>），慢客户端不拖累总线。</li>
       <li><b>订阅速率</b>：<code>rate_hz ≥ 54</code> 时直通（每个轮询帧都推）；更低频率按时间抽帧。</li>
-      <li><b>自愈</b>：连续 3 次读失败判掉线 → 每 <code>reconnect_sec</code>（默认 2s）重连；连接时 ping 全部电机握手。</li>
+      <li><b>自愈</b>：连续 3 次传输层读失败判掉线 → <b>先 close 释放 fd</b> 再每 <code>reconnect_sec</code>（默认 2s）重连；连接时 ping 全部电机握手，≥1 个响应即 connected（单电机故障只记 per-motor error）。</li>
+      <li><b>安全层（v0.2.0）</b>：每电机 StallTracker 堵转检测（默认 400ms → torque OFF + goal 回退 + <code>event:"stall"</code>）；写 Goal 前软限位（EEPROM Min/Max）；单电机 hardware error 只标记该电机，不再拖垮整臂 worker。详见 <a href="#safety">安全层</a>。</li>
       <li><b>单实例</b>：打开串口前先拿 <code>&lt;socket&gt;.lock</code>（File::try_lock）；启动时探测已有 socket，活的拒绝抢占、死的清理。</li>
     </ul>
+  </section>
+
+  <section class="block" id="safety">
+    <h2>{esc(SAFETY["title"])}</h2>
+    <div class="warn">{esc(SAFETY["intro"])}</div>
+    <h3>三道防线</h3>
+    {safety_guardrails}
+    <h3>恢复流程</h3>
+    {safety_flows}
+    <h3>硬件 error 位（Hardware_Error_Status=70）</h3>
+    {safety_bits}
+    <h3>安全配置默认值</h3>
+    {safety_defaults}
+    <h3>注意事项</h3>
+    <ul>{safety_notes}</ul>
   </section>
 
   <section class="block" id="install">
@@ -354,7 +428,17 @@ sudo cat /run/armd/identity.json''')}
       "monitor": true,
       "joint_names": {"1": "shoulder_pan", "2": "shoulder_lift", "3": "elbow_flex",
                        "4": "wrist_flex", "5": "wrist_roll", "6": "gripper"},
-      "profile": "~/.config/armd/profiles/koch_v1_1-follower.json"
+      "profile": "~/.config/armd/profiles/koch_v1_1-follower.json",
+      "stall_protection": true,
+      "stall_timeout_ms": 400,
+      "stall_tolerance": 60,
+      "stall_velocity_epsilon": 2,
+      "auto_torque_off": true,
+      "stall_recover_margin": 20,
+      "stall_exclude_motors": [6],
+      "soft_limits": true,
+      "soft_limit_mode": "clamp",
+      "soft_limit_margin": 10
     }
   ]
 }''')}
@@ -424,7 +508,13 @@ python3 clients/python/armd_client.py --socket /tmp/armd.sock watch   koch_v1_1:
 python3 clients/python/armd_client.py --socket /tmp/armd.sock torque  koch_v1_1:follower 0
 python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:follower
 python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:follower --history
-python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1:follower''')}
+python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1:follower
+# v0.2.0 安全层 / 故障恢复
+python3 clients/python/armd_client.py --socket /tmp/armd.sock safety        koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd.sock torque-off    koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd.sock reboot        koch_v1_1:follower --motors 3
+python3 clients/python/armd_client.py --socket /tmp/armd.sock clear-error   koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd-sim.sock sim-inject sim stall --motors 3''')}
   </section>
 
   <section class="block" id="errors">
@@ -437,6 +527,26 @@ python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1
     <h3>启动失败：另一个 armd 已经持有 …lock</h3>
     <p>单实例锁 <code>&lt;socket&gt;.lock</code> 被占用。先确认没有在跑的 armd（<code>pgrep -fl armd</code>）；
     锁文件本身不需要删除（进程退出内核自动释放）。</p>
+    <h3>Device or resource busy / 串口 fd 泄漏</h3>
+    <p>这是 v0.1.0 事故的根因（详见 <code>docs/INCIDENT-2026-11-22.md</code>）：读失败后旧 fd 未释放，
+    TIOCEXCL 让再次 open 永远 EBUSY。v0.2.0 已修：<code>Link</code> 保证 open 前先 close，读失败 3 次先释放 fd 再重连。
+    <b>处置</b>：升级 v0.2.0 → <code>arm.reconnect</code>（立即 close 再 open）→ 仍 busy 用
+    <code>lsof /dev/cu.usbmodem*</code> 确认没有其它进程（如 zeropose 直连）占用；插拔 USB 后 armd 会自动重连。
+    fd 不变量：connected 期间 <code>stats.opens - stats.closes == 1</code>，断线释放后二者相等。</p>
+    <h3>舵机报 latched 硬件错误 0x80（hardware_alert）</h3>
+    <p>典型是堵转/顶住限位后舵机 latch 的错误，普通重连不会清除。
+    用 <code>arm.reboot</code>（Dynamixel Reboot 0x08，最长 5s）清除；<code>arm.clear_error</code> 只清 armd 侧标记，
+    若 <code>hardware_error_status</code> 仍非 0，warnings 会提示必须 reboot/断电。详见 <a href="#safety">安全层</a>。</p>
+    <h3>收到 event:"stall" / state.stalls 有记录</h3>
+    <p>堵转保护已触发：该电机 torque OFF + goal 回退到限位内侧。先排除机械卡死/限位/负载问题，
+    再给安全的新目标（写入即清除该电机 stall 标记）并 <code>arm.torque(enable=true)</code>。
+    夹爪夹住物体时 Goal-Present 长期有偏差属正常——已在 shipped configs 用
+    <code>stall_exclude_motors: [6]</code> 排除，不要靠关掉 <code>stall_protection</code> 解决反复触发。</p>
+    <h3>单个舵机不动，但其它电机/订阅正常</h3>
+    <p>v0.2.0 起单电机故障被隔离：看 <code>arm.list[].motor_errors</code> / <code>arm.state.motor_errors</code>。
+    <code>code=128</code> 是 latched 硬件错误（用 <code>arm.reboot</code>）；
+    <code>code=null</code> / names 含 <code>no_response</code> 是连续 ≥10 次读不到（检查供电/线缆/ID）。
+    <code>connected</code> 仍为 true 是预期行为，不再整臂掉线。</p>
     <h3>macOS：进程刚起就被 SIGKILL（Code Signature Invalid）</h3>
     <p>拷贝过的二进制需要重签：<code>codesign --force --sign - ~/.local/bin/armd</code>；用 <code>scripts/deploy-macos.sh</code> 可避免。</p>
     <h3>Linux 板子：舵机全都不响应</h3>
@@ -457,8 +567,7 @@ python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1
   <section class="block" id="changelog">
     <h2>版本与兼容</h2>
     <ul>
-      <li><b>v{esc(API["version"])}</b>（{esc(API["updated"])}）：JSON-RPC 2.0 兼容、token 鉴权、Unix+TCP 双传输、
-      标定档案 profile + 历史快照/恢复、电压/温度监控、ARM 交叉编译产物。</li>
+      {changelog_html}
       <li>协议稳定性：方法名/字段只增不改；新增可选字段老客户端可忽略。</li>
       <li>机器可读规范：<code>docs/api.json</code>（本页由它生成：<code>python3 scripts/gen-armd-doc.py</code>）。</li>
     </ul>
@@ -560,6 +669,29 @@ def render_markdown() -> str:
     for e in API["events"]:
         lines += [f"### `{e['event']}`", "", e.get("desc", ""), "", "```json",
                   json.dumps(e.get("fields"), ensure_ascii=False, indent=2), "```", ""]
+    lines += ["## 安全层（stall / 软限位 / 故障隔离）", "", SAFETY["intro"], "", "### 三道防线", ""]
+    for g in SAFETY["guardrails"]:
+        lines += [
+            f"#### {g['name']}", "",
+            f"- 触发：{g['trigger']}",
+            f"- 动作：{g['action']}",
+            f"- 观察/验收：{g['observe']}",
+            f"- 默认值：`{g['defaults']}`", "",
+        ]
+    lines += ["### 恢复流程", ""]
+    for f in SAFETY["recovery_flows"]:
+        lines += [f"#### {f['title']}", ""]
+        lines += [f"{i}. {st}" for i, st in enumerate(f["steps"], 1)]
+        lines.append("")
+    lines += ["### 硬件 error 位（Hardware_Error_Status=70）", "", "| 位 | 名称 | 含义 |", "|---|---|---|"]
+    for b in SAFETY["hardware_error_bits"]:
+        lines.append(f"| `{b['mask']}` | `{b['name']}` | {b['meaning']} |")
+    lines += ["", "### 安全配置默认值", "", "| 配置项 | 默认 | 含义 |", "|---|---|---|"]
+    for d in SAFETY["defaults"]:
+        lines.append(f"| `{d['field']}` | `{d['default']}` | {d['meaning']} |")
+    lines += ["", "### 注意事项", ""]
+    lines += [f"- {n}" for n in SAFETY["notes"]]
+    lines += [""]
     lines += ["## 错误码", "", "| 错误码 | 含义 |", "|---|---|"]
     for e in API["errors"]:
         lines.append(f"| `{e['code']}` | {e['meaning']} |")
@@ -573,7 +705,12 @@ def render_markdown() -> str:
     lines += ["## 配置项", "", "| 配置项 | 默认值 | 说明 |", "|---|---|---|"]
     for c in API["config_fields"]:
         lines.append(f"| `{c['key']}` | {c.get('default', '—')} | {c.get('desc', '')} |")
-    lines += ["", f"仓库：{API['packages']['repo']}；客户端：{API['packages']['python_client']}", ""]
+    lines += ["", f"仓库：{API['packages']['repo']}；客户端：{API['packages']['python_client']}", f"CLI：`{API['packages']['cli']}`", ""]
+    lines += ["## 版本", ""]
+    for c in API.get("changelog", []):
+        lines += [f"### v{c['version']}（{c['date']}）", ""]
+        lines += [f"- {i}" for i in c["items"]]
+        lines.append("")
     return "\n".join(lines)
 
 

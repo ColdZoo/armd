@@ -8,4 +8,5 @@ pub mod config;
 pub mod dxl;
 pub mod port;
 pub mod profile;
+pub mod safety;
 pub mod server;

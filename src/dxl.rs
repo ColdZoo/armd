@@ -12,6 +12,8 @@ pub const BROADCAST_ID: u8 = 0xFE;
 pub const INST_PING: u8 = 0x01;
 pub const INST_READ: u8 = 0x02;
 pub const INST_WRITE: u8 = 0x03;
+/// Dynamixel Reboot：清除 latched 硬件错误（0x80），舵机复位后 RAM 恢复默认
+pub const INST_REBOOT: u8 = 0x08;
 pub const INST_SYNC_READ: u8 = 0x82;
 pub const INST_SYNC_WRITE: u8 = 0x83;
 
@@ -19,9 +21,14 @@ pub const INST_SYNC_WRITE: u8 = 0x83;
 pub const ADDR_DRIVE_MODE: u16 = 10;
 pub const ADDR_OPERATING_MODE: u16 = 11;
 pub const ADDR_HOMING_OFFSET: u16 = 20;
+pub const ADDR_MAX_POSITION_LIMIT: u16 = 48; // EEPROM, 2B
+pub const ADDR_MIN_POSITION_LIMIT: u16 = 50; // EEPROM, 2B
 pub const ADDR_TORQUE_ENABLE: u16 = 64;
+pub const ADDR_HARDWARE_ERROR_STATUS: u16 = 70;
 pub const ADDR_GOAL_POSITION: u16 = 116;
+pub const ADDR_PRESENT_VELOCITY: u16 = 128;
 pub const ADDR_PRESENT_POSITION: u16 = 132;
+pub const ADDR_PRESENT_INPUT_VOLTAGE: u16 = 144;
 pub const ADDR_PRESENT_TEMPERATURE: u16 = 146;
 
 const fn crc_table() -> [u16; 256] {
@@ -126,6 +133,10 @@ pub fn write_packet(id: u8, addr: u16, data: &[u8]) -> Vec<u8> {
     packet(INST_WRITE, id, &p)
 }
 
+pub fn reboot_packet(id: u8) -> Vec<u8> {
+    packet(INST_REBOOT, id, &[])
+}
+
 pub fn sync_read_packet(id: u8, addr: u16, len: u16, motors: &[u8]) -> Vec<u8> {
     let mut p = vec![(addr & 0xFF) as u8, (addr >> 8) as u8, (len & 0xFF) as u8, (len >> 8) as u8];
     p.extend_from_slice(motors);
@@ -139,6 +150,24 @@ pub fn sync_write_packet(id: u8, addr: u16, len: u16, values: &[(u8, Vec<u8>)]) 
         p.extend_from_slice(v);
     }
     packet(INST_SYNC_WRITE, id, &p)
+}
+
+/// 轮询窗口 `addr=128, len=8`：前 4 字节 Present_Velocity，后 4 字节 Present_Position。
+pub fn velocity_position(data: &[u8]) -> Option<(i64, i64)> {
+    if data.len() < 8 {
+        return None;
+    }
+    Some((le_int(&data[0..4]), le_int(&data[4..8])))
+}
+
+/// EEPROM Min/Max Position Limit 窗口 `addr=48, len=4`：先 Max(2B) 后 Min(2B)。
+pub fn position_limits(data: &[u8]) -> Option<(i64, i64)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let max = le_int(&data[0..2]);
+    let min = le_int(&data[2..4]);
+    Some((min, max))
 }
 
 /// 有符号小端编码（长度 1/2/4 字节）。
@@ -227,6 +256,43 @@ mod tests {
         assert_eq!(&p[8..12], &[0x84, 0x00, 0x04, 0x00]);
         assert_eq!(&p[12..18], &[1, 2, 3, 4, 5, 6]);
         assert_eq!(&p[p.len() - 2..], &crc16(&p[..p.len() - 2]).to_le_bytes());
+    }
+
+    #[test]
+    fn reboot_packet_layout() {
+        let p = reboot_packet(3);
+        assert_eq!(&p[..4], &HEADER);
+        assert_eq!(p[4], 3);
+        assert_eq!(p[7], INST_REBOOT);
+        // LEN = params(0) + 3 = 3
+        assert_eq!(&p[5..7], &[3, 0]);
+        assert_eq!(&p[p.len() - 2..], &crc16(&p[..p.len() - 2]).to_le_bytes());
+        // 广播 reboot（0xFE）也是合法帧
+        let b = reboot_packet(BROADCAST_ID);
+        assert_eq!(b[4], BROADCAST_ID);
+        assert_eq!(&b[b.len() - 2..], &crc16(&b[..b.len() - 2]).to_le_bytes());
+    }
+
+    #[test]
+    fn velocity_position_window() {
+        // Present_Velocity = 0, Present_Position = 1511
+        let mut data = le_bytes(0, 4);
+        data.extend_from_slice(&le_bytes(1511, 4));
+        assert_eq!(velocity_position(&data), Some((0, 1511)));
+        // 负速度（反向）
+        let mut neg = le_bytes(-7, 4);
+        neg.extend_from_slice(&le_bytes(3300, 4));
+        assert_eq!(velocity_position(&neg), Some((-7, 3300)));
+        assert_eq!(velocity_position(&data[..7]), None);
+    }
+
+    #[test]
+    fn position_limit_window() {
+        // Max=3309, Min=1607（真机从臂肘部的 EEPROM 限位示例）
+        let mut data = le_bytes(3309, 2);
+        data.extend_from_slice(&le_bytes(1607, 2));
+        assert_eq!(position_limits(&data), Some((1607, 3309)));
+        assert_eq!(position_limits(&data[..3]), None);
     }
 
     #[test]

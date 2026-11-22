@@ -9,6 +9,7 @@
 use crate::arm::{now_ms, ArmHandle, Cmd, Request, Sub};
 use crate::config::Config;
 use crate::dxl;
+use crate::port::IoError;
 use crate::profile::{joint_degrees, validate as validate_profile};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -517,6 +518,60 @@ impl Daemon {
                     1000,
                 )
             }
+            "arm.torque_off" => {
+                // 便捷方法：等价 arm.torque enable=false（逐电机 torque OFF）
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let ids = optional_motors(params).unwrap_or_else(|| arm.cfg.motors.clone());
+                let vals: Vec<(u8, Vec<u8>)> =
+                    ids.into_iter().map(|id| (id, dxl::le_bytes(0, 1))).collect();
+                call_arm(
+                    &arm,
+                    Cmd::SyncWrite { addr: dxl::ADDR_TORQUE_ENABLE, len: 1, values: vals },
+                    true,
+                    1000,
+                )
+            }
+            "arm.reboot" => {
+                // Dynamixel Reboot(0x08)：清除 latched 硬件错误；worker 内等 ~600ms + ping，最长 5s
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let ids = optional_motors(params).unwrap_or_else(|| arm.cfg.motors.clone());
+                call_arm(&arm, Cmd::Reboot { ids }, true, 5000)
+            }
+            "arm.clear_error" => {
+                // 只清 armd 侧标记 + 读 Hardware_Error_Status(70)；latched 错误仍需 reboot
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let ids = optional_motors(params).unwrap_or_else(|| arm.cfg.motors.clone());
+                call_arm(&arm, Cmd::ClearError { ids }, true, 2000)
+            }
+            "arm.sim.inject" => {
+                // 仅仿真臂：注入/清除故障
+                // （stall / hardware_error / no_response / transport_error / clear）
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                if !arm.cfg.sim {
+                    return Err(RpcError::new(
+                        "not_sim",
+                        format!(
+                            "机械臂 '{}' 不是仿真臂（sim=false），不支持故障注入",
+                            arm.cfg.id
+                        ),
+                    ));
+                }
+                let kind = str_param(params, "kind")?;
+                if !matches!(
+                    kind.as_str(),
+                    "stall" | "hardware_error" | "no_response" | "transport_error" | "clear"
+                ) {
+                    return Err(RpcError::new(
+                        "bad_request",
+                        format!(
+                            "kind 必须是 stall/hardware_error/no_response/transport_error/clear，收到 '{kind}'"
+                        ),
+                    ));
+                }
+                let enable = params.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+                let ids = optional_motors(params).unwrap_or_else(|| arm.cfg.motors.clone());
+                call_arm(&arm, Cmd::SimInject { kind, ids, enable }, true, 1000)
+            }
             "arm.ping" => {
                 let arm = self.arm(&str_param(params, "arm")?)?;
                 let motor = u8_param(params, "motor")?;
@@ -601,6 +656,11 @@ impl Daemon {
         let mut out = Vec::new();
         for (id, arm) in &self.arms {
             let st = arm.state.read().unwrap();
+            // 安全层摘要与 arm.state 同源：直接取 state JSON 里的 motor_errors/stalls 对象
+            let state_json = st.to_json();
+            let motor_errors =
+                state_json.get("motor_errors").cloned().unwrap_or_else(|| json!({}));
+            let stalls = state_json.get("stalls").cloned().unwrap_or_else(|| json!({}));
             out.push(json!({
                 "id": id,
                 "label": arm.cfg.label,
@@ -612,6 +672,8 @@ impl Daemon {
                 "seq": st.seq,
                 "error": st.error,
                 "profile_saved_at": st.profile_saved_at,
+                "motor_errors": motor_errors,
+                "stalls": stalls,
                 "stats": arm.stats.to_json(),
             }));
         }
@@ -659,8 +721,22 @@ fn call_arm(arm: &Arc<ArmHandle>, cmd: Cmd, urgent: bool, wait_ms: u64) -> RpcRe
         .map_err(|q| RpcError::new("queue_full", format!("{q} 队列已满")))?;
     match rx.recv_timeout(Duration::from_millis(wait_ms)) {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(RpcError::new("serial_error", e.to_string())),
+        Ok(Err(e)) => Err(io_error_to_rpc(e)),
         Err(_) => Err(RpcError::new("timeout", "机械臂 worker 响应超时")),
+    }
+}
+
+/// worker 返回的 IO/安全层错误 → RPC 错误码。
+///
+/// - `SoftLimit`（`soft_limit_mode="reject"` 时写 Goal 越界）→ `soft_limit`
+/// - `Unsupported`（真机臂不支持的操作，如 `arm.sim.inject`）→ `not_sim`
+/// - `Device`（舵机硬件 error 位）→ `serial_error`（保持 v0.1.0 语义）
+/// - 其余传输层错误 → `serial_error`
+fn io_error_to_rpc(e: IoError) -> RpcError {
+    match &e {
+        IoError::SoftLimit { .. } => RpcError::new("soft_limit", e.to_string()),
+        IoError::Unsupported => RpcError::new("not_sim", e.to_string()),
+        _ => RpcError::new("serial_error", e.to_string()),
     }
 }
 

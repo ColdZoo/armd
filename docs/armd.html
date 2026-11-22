@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>armd — 机械臂串口守护进程 · 开发文档 v0.1.0</title>
+<title>armd — 机械臂串口守护进程 · 开发文档 v0.2.0</title>
 <style>
   :root {
     --bg: #0b1220; --panel: #111a2b; --text: #dbe6f3; --muted: #8aa0b8;
@@ -82,13 +82,14 @@
 <div class="layout">
 <aside>
   <h1>armd</h1>
-  <div class="ver">v0.1.0 · 更新于 2026-11-22<br>机械臂串口守护进程</div>
+  <div class="ver">v0.2.0 · 更新于 2026-11-22<br>机械臂串口守护进程</div>
   <input class="search" id="search" placeholder="搜索方法/配置/错误码…" autocomplete="off">
   
 <ul class="toc">
   <li><a href="#overview">概览</a></li>
   <li><a href="#quickstart">快速开始</a></li>
   <li><a href="#architecture">架构与队列</a></li>
+  <li><a href="#safety">安全层</a></li>
   <li><a href="#install">安装部署</a></li>
   <li><a href="#config">配置参考</a></li>
   <li><a href="#protocol">传输与协议</a></li>
@@ -104,7 +105,7 @@
 </aside>
 <main>
   <h1 class="page">armd — 机械臂串口守护进程 <small>开发文档</small></h1>
-  <div class="meta">Dynamixel 机械臂串口守护进程：独占串口总线，对上层提供 NDJSON RPC 与发布订阅；持有标定档案（profile）。</div>
+  <div class="meta">Dynamixel 机械臂串口守护进程：独占串口总线，对上层提供 NDJSON RPC 与发布订阅；持有标定档案（profile）；v0.2.0 起内置安全层（堵转保护 / 软限位 / 单电机故障隔离）。</div>
 
   <section class="block" id="overview">
     <h2>概览</h2>
@@ -116,6 +117,7 @@
       <div class="card"><b>单进程多臂</b><br>一条总线一个 worker 线程；主臂/从臂可同时在线</div>
       <div class="card"><b>RPC + 发布订阅</b><br>Unix socket / TCP 上的 NDJSON；任意语言可接</div>
       <div class="card"><b>标定档案</b><br>zero/sign/grip 由 armd 持有，自动历史快照可恢复</div>
+      <div class="card"><b>安全层</b><br>堵转保护 + 软限位 + 单电机故障隔离（v0.2.0）</div>
       <div class="card"><b>ARM 下位机</b><br>交叉编译 aarch64/armv7，systemd + TCP + token</div>
     </div>
     <div class="note">快速判断"该不该用 armd"：只要你的程序需要读/写机械臂舵机，就应该连 armd；
@@ -169,9 +171,28 @@ python3 clients/python/armd_client.py --socket tcp://arm-board.my:8771 --token $
       <li><b>轮询合并</b>：一次 <code>sync_read</code> 读全部电机，结果写状态缓存；所有订阅者共享这次读数。</li>
       <li><b>发布背压</b>：每个订阅者一个容量 32 的有界队列，满了丢帧并计数（<code>frames_dropped</code>），慢客户端不拖累总线。</li>
       <li><b>订阅速率</b>：<code>rate_hz ≥ 54</code> 时直通（每个轮询帧都推）；更低频率按时间抽帧。</li>
-      <li><b>自愈</b>：连续 3 次读失败判掉线 → 每 <code>reconnect_sec</code>（默认 2s）重连；连接时 ping 全部电机握手。</li>
+      <li><b>自愈</b>：连续 3 次传输层读失败判掉线 → <b>先 close 释放 fd</b> 再每 <code>reconnect_sec</code>（默认 2s）重连；连接时 ping 全部电机握手，≥1 个响应即 connected（单电机故障只记 per-motor error）。</li>
+      <li><b>安全层（v0.2.0）</b>：每电机 StallTracker 堵转检测（默认 400ms → torque OFF + goal 回退 + <code>event:"stall"</code>）；写 Goal 前软限位（EEPROM Min/Max）；单电机 hardware error 只标记该电机，不再拖垮整臂 worker。详见 <a href="#safety">安全层</a>。</li>
       <li><b>单实例</b>：打开串口前先拿 <code>&lt;socket&gt;.lock</code>（File::try_lock）；启动时探测已有 socket，活的拒绝抢占、死的清理。</li>
     </ul>
+  </section>
+
+  <section class="block" id="safety">
+    <h2>安全层（v0.2.0，三道防线）</h2>
+    <div class="warn">2026-11-22 事故：从臂肘部（motor 3，XL430/XL330）顶住机械限位持续输出力矩 → 舵机 latch hardware error 0x80 → follower worker 读失败/重连 → 串口 fd 未释放，Device or resource busy 无法恢复，只能重启 armd + 物理断电。事故记录见 docs/INCIDENT-2026-11-22.md，冻结规范见 docs/SAFETY-DESIGN.md。v0.2.0 把「不把机械臂顶坏、不让单电机拖垮整臂、不泄漏串口 fd」固化为三道防线。</div>
+    <h3>三道防线</h3>
+    <div class="table-wrap"><table><thead><tr><th>防线</th><th>触发条件</th><th>动作</th><th>如何观察/验收</th><th>默认值</th></tr></thead><tbody><tr><td><b>① 堵转保护（最后一道防线）</b></td><td>每电机 StallTracker：|goal - present| &gt; stall_tolerance(60) 且 |velocity| &lt;= stall_velocity_epsilon(2) 且 torque_on，持续 stall_timeout_ms(400)；stall_exclude_motors 里的电机跳过</td><td>只对该电机：先 sync_write Torque_Enable=0（auto_torque_off=true 时，默认开）→ goal 回退到 present 附近（夹到 [min+stall_recover_margin, max-stall_recover_margin]）→ state.stalls + stats.stalls + event:&quot;stall&quot;；同臂其他电机完全不受影响</td><td>arm.state.stalls / event:&quot;stall&quot;；arm.read_register(motor, 64, 1) 应读到 0；不会产生 0x80</td><td><code>stall_protection=true, stall_timeout_ms=400, stall_tolerance=60, stall_velocity_epsilon=2, auto_torque_off=true, stall_recover_margin=20, stall_exclude_motors=[]（建议夹爪填 [6]）</code></td></tr><tr><td><b>② 软限位（写 Goal 前拦截）</b></td><td>写 Goal_Position(116)（arm.write_register / arm.sync_write）且 soft_limits=true；生效范围由该电机的 Operating_Mode(11) 决定</td><td>位置模式(mode 3) 或模式未知：先夹到绝对范围 0..=4095，再按 EEPROM Min/Max Position Limit 夹到 [min+soft_limit_margin, max-soft_limit_margin]；扩展位置模式(mode 4)：只夹到绝对范围 ±1,048,575，不套 EEPROM Min/Max（它只适用于单圈位置模式，否则多圈目标会被错误夹住）。clamp 模式（默认）下发夹紧值并回 clamped/warnings；reject 模式返回 soft_limit 错误、不下发</td><td>mode 3 下 arm.write_register(116, 5000) → applied=4095-margin 或 soft_limit 错误；mode 4（主臂）允许负值/&gt;4095 的多圈目标；写成功清除该电机 stall 标记。worker 连接时读 Operating_Mode 并每秒刷新、跟踪对 addr 11 的写入（遥操作启动时把从臂切到 3）</td><td><code>soft_limits=true, soft_limit_mode=&quot;clamp&quot;, soft_limit_margin=10</code></td></tr><tr><td><b>③ 单电机故障隔离 + 串口 fd 生命周期</b></td><td>某个舵机状态包 error 位非 0（如 0x80）或连续 ≥10 次轮询无响应</td><td>sync_read 按电机返回 {data, errors}，单电机 error 只写 motor_errors[id]（事件 motor_error），connected 保持 true、其他电机正常；故障恢复自动清除并发 motor_recovered；Link 保证 open 前先 close 旧句柄、读失败 3 次先 close 再重连，打开失败时 io=None，绝不占着 fd 再 open</td><td>arm.list[].motor_errors / arm.state.motor_errors；fd 不变量：connected 期间 opens - closes == 1（恰好一个 live 串口句柄），断线释放后二者相等；arm.reconnect ×20 后 lsof 每设备仍只有 1 个 fd；用 sim.inject transport_error 可验证断线后 fd 先释放</td><td><code>无需配置；connected 语义见 arm.state.connected</code></td></tr></tbody></table></div>
+    <h3>恢复流程</h3>
+    <h3>latched 硬件错误（0x80 hardware_alert）恢复</h3>
+    <ol><li>arm.list 或 arm.state 确认 motor_errors[电机].code == 128（names 含 hardware_alert），记下电机 id</li><li>arm.state.stalls 查看是否由堵转触发；排查机械卡死/限位/NFS 等外部原因</li><li>arm.reboot(motors=[该电机]) —— Dynamixel Reboot(0x08) 清除 latched 错误（最长等 5s；成功时 torque 自动置 false）</li><li>arm.clear_error(motors=[该电机]) 只清 armd 侧标记；若 hardware_error_status 仍非 0，warnings 会提示必须 reboot/断电</li><li>确认 motor_errors 已空、connected=true 后，再 arm.torque(enable=true) 恢复使能（或重新写目标）</li></ol><h3>堵转触发后恢复</h3>
+    <ol><li>arm.state.stalls[电机] 看 position/goal/stall_ms/reverted_goal；event:&quot;stall&quot; 可实时发现</li><li>排除机械卡死：手动活动关节、检查线缆/限位/负载，确认不是软件目标导致顶死</li><li>需要继续动作时：先给安全的新目标（arm.write_register 116 或 arm.sync_write，会先过软限位），或在应用里把目标收回到可达范围</li><li>target 更新成功后该电机 stall 标记自动清除；再 arm.torque(enable=true) 重新使能</li><li>反复触发说明负载/限位/标定参数有问题，不要简单关掉 stall_protection</li></ol><h3>串口 Device or resource busy / fd 泄漏（事故根因）</h3>
+    <ol><li>v0.1.0 中读失败后旧 fd 不释放、再次 open 永远 EBUSY（lsof 可见每设备多 fd）。升级 v0.2.0 后该根因已修复</li><li>现场处置：升级 armd → arm.reconnect（先 close 再 open，fd 立即释放）→ 仍 busy 时用 lsof /dev/cu.usbmodem* 确认没有其它进程占用（zeropose 直连等）</li><li>设备节点消失/仅剩旧 fd：unplug 后重新插上，armd 会自动重连；用 arm.stats.opens/closes 判断是否有泄漏：connected 期间差值为 1（恰好一个 live 句柄），断线释放后二者相等；差值 &gt;1 才说明泄漏</li><li>latched 0x80 不会因重连消失，必须 arm.reboot 或物理断电；连不上总线时 arm.list.error 会给出 open 错误</li></ol>
+    <h3>硬件 error 位（Hardware_Error_Status=70）</h3>
+    <div class="table-wrap"><table><thead><tr><th>位</th><th>名称</th><th>含义</th></tr></thead><tbody><tr><td><code>0x80</code></td><td><code>hardware_alert</code></td><td>硬件告警（典型：堵转/过载导致的 latched 错误），需 arm.reboot 清除</td></tr><tr><td><code>0x20</code></td><td><code>overload</code></td><td>过载</td></tr><tr><td><code>0x10</code></td><td><code>electrical_shock</code></td><td>电气冲击</td></tr><tr><td><code>0x08</code></td><td><code>motor_encoder</code></td><td>电机/编码器异常</td></tr><tr><td><code>0x04</code></td><td><code>overheating</code></td><td>过温</td></tr><tr><td><code>0x01</code></td><td><code>input_voltage</code></td><td>输入电压异常</td></tr><tr><td><code>其他位</code></td><td><code>reserved_bit_N</code></td><td>保留位，按位名上报</td></tr></tbody></table></div>
+    <h3>安全配置默认值</h3>
+    <div class="table-wrap"><table><thead><tr><th>配置项</th><th>默认</th><th>含义</th></tr></thead><tbody><tr><td><code>stall_protection</code></td><td><code>true</code></td><td>堵转保护总开关</td></tr><tr><td><code>stall_timeout_ms</code></td><td><code>400</code></td><td>条件持续多久触发（建议 300–500）</td></tr><tr><td><code>stall_tolerance</code></td><td><code>60</code></td><td>|Goal-Present| 偏差阈值（counts）</td></tr><tr><td><code>stall_velocity_epsilon</code></td><td><code>2</code></td><td>视为静止的 |Present_Velocity| 阈值（X 系列单位 0.229rpm）</td></tr><tr><td><code>auto_torque_off</code></td><td><code>true</code></td><td>触发时自动对故障电机 torque OFF</td></tr><tr><td><code>stall_recover_margin</code></td><td><code>20</code></td><td>回退目标离 EEPROM 限位内侧的余量（counts）</td></tr><tr><td><code>stall_exclude_motors</code></td><td><code>[]（shipped configs：&quot;[6]&quot;）</code></td><td>不参与堵转自动保护的电机；建议把夹爪（6）排除：夹住物体时 Goal-Present 长期有偏差属正常，否则会误触发</td></tr><tr><td><code>soft_limits</code></td><td><code>true</code></td><td>写 Goal_Position 时用 EEPROM Min/Max Position Limit 做软限位</td></tr><tr><td><code>soft_limit_mode</code></td><td><code>&quot;clamp&quot;</code></td><td>clamp=夹紧+警告；reject=返回 soft_limit 错误</td></tr><tr><td><code>soft_limit_margin</code></td><td><code>10</code></td><td>软限位内侧余量（counts）</td></tr></tbody></table></div>
+    <h3>注意事项</h3>
+    <ul><li>堵转检测依赖轮询窗口里的 Present_Velocity。poll_addr 未显式配置且 stall_protection=true 时，poll 窗口自动用 addr=128、len=8（一次 sync_read 同时读 velocity+position，只多 4 字节/电机）；显式配置 poll_addr/poll_len 时维持旧语义，velocity 未知 → 堵转检测自动跳过并打一条警告日志。</li><li>arm.read/arm.state 的 errors 是「该电机状态包带 error 位」，不是传输失败；完全没响应的电机不出现在 data/errors 中，连续 ≥10 次（约 167ms@60Hz）标记 no_response。</li><li>夹住物体时夹爪的电机会持续存在 Goal-Present 偏差且 velocity≈0，属正常保持而非堵转。用 stall_exclude_motors 把夹爪（如 6）排除出堵转自动保护；本仓库 configs/koch*.json 已写 [6]。事故中的 motor 3（肘部）不在排除列表里。</li><li>软限位按 Operating_Mode(11) 生效：位置模式(mode 3) 用 EEPROM Min/Max 且绝对 0..4095；扩展位置模式(mode 4) 只做 ±1,048,575 绝对范围，不套 EEPROM 限位（主臂真实电机是 mode 4）。worker 连接时读 Operating_Mode，每秒刷新并跟踪对 addr 11 的写入（遥操作启动时会把从臂切到 3）。</li><li>多圈关节（主臂 mode 4）的 state.joints / state.velocity / goals 可以超出 0..4095（实测 pan 6133、roll -2889），这是正常的多圈位置，不是坏值；换算角度时由 profile 的 wrap 逻辑处理。</li><li>fd 不变量：connected 期间恰好有 1 个 live 串口句柄，即 stats.opens - stats.closes == 1；worker 关闭/断线释放 fd 后两者相等。arm.sim.inject 的 transport_error 往整条总线注入传输错误（模拟 USB 掉线），worker 连续 3 次传输失败后先 close 释放 fd 再按 reconnect_sec 重连，可用于验证释放路径；清除注入后恢复。</li><li>所有新配置项均可省略（serde default），旧 v0.1.0 配置无需改动；旧客户端可忽略新增字段。</li></ul>
   </section>
 
   <section class="block" id="install">
@@ -214,11 +235,21 @@ sudo cat /run/armd/identity.json</code></pre>
       &quot;monitor&quot;: true,
       &quot;joint_names&quot;: {&quot;1&quot;: &quot;shoulder_pan&quot;, &quot;2&quot;: &quot;shoulder_lift&quot;, &quot;3&quot;: &quot;elbow_flex&quot;,
                        &quot;4&quot;: &quot;wrist_flex&quot;, &quot;5&quot;: &quot;wrist_roll&quot;, &quot;6&quot;: &quot;gripper&quot;},
-      &quot;profile&quot;: &quot;~/.config/armd/profiles/koch_v1_1-follower.json&quot;
+      &quot;profile&quot;: &quot;~/.config/armd/profiles/koch_v1_1-follower.json&quot;,
+      &quot;stall_protection&quot;: true,
+      &quot;stall_timeout_ms&quot;: 400,
+      &quot;stall_tolerance&quot;: 60,
+      &quot;stall_velocity_epsilon&quot;: 2,
+      &quot;auto_torque_off&quot;: true,
+      &quot;stall_recover_margin&quot;: 20,
+      &quot;stall_exclude_motors&quot;: [6],
+      &quot;soft_limits&quot;: true,
+      &quot;soft_limit_mode&quot;: &quot;clamp&quot;,
+      &quot;soft_limit_margin&quot;: 10
     }
   ]
 }</code></pre>
-    <div class="table-wrap"><table><thead><tr><th>配置项</th><th>默认值</th><th>说明</th></tr></thead><tbody><tr><td><code>socket</code></td><td><code>/tmp/armd.sock</code></td><td>兼容字段：未配 listen 时等价 listen=[unix:&lt;socket&gt;]</td></tr><tr><td><code>listen</code></td><td><code>[]</code></td><td>监听地址数组：unix:&lt;path&gt; / tcp://host:port</td></tr><tr><td><code>token</code></td><td><code>null</code></td><td>可选访问令牌</td></tr><tr><td><code>identity</code></td><td><code>/tmp/armd-identity.json 或 /run/armd/identity.json</code></td><td>身份文件路径</td></tr><tr><td><code>arms[].id</code></td><td><code>—</code></td><td>对外 arm id，建议 &lt;robot&gt;:&lt;role&gt;</td></tr><tr><td><code>arms[].port</code></td><td><code>—</code></td><td>串口设备路径（sim=true 可空）</td></tr><tr><td><code>arms[].baud</code></td><td><code>1000000</code></td><td>波特率</td></tr><tr><td><code>arms[].poll_hz</code></td><td><code>60</code></td><td>轮询频率</td></tr><tr><td><code>arms[].motors</code></td><td><code>[1,2,3,4,5,6]</code></td><td>轮询的舵机 id</td></tr><tr><td><code>arms[].monitor</code></td><td><code>False</code></td><td>每秒读电压/温度（寄存器 144/146）</td></tr><tr><td><code>arms[].joint_names</code></td><td><code>{}</code></td><td>舵机 id→关节名，标定档案与角度换算必需</td></tr><tr><td><code>arms[].profile</code></td><td><code>~/.config/armd/profiles/&lt;arm-id&gt;.json</code></td><td>标定档案路径</td></tr><tr><td><code>arms[].sim</code></td><td><code>False</code></td><td>仿真臂</td></tr><tr><td><code>arms[].reconnect_sec</code></td><td><code>2.0</code></td><td>断线重连间隔</td></tr><tr><td><code>arms[].read_timeout_ms</code></td><td><code>30</code></td><td>单次 sync_read 超时</td></tr></tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>配置项</th><th>默认值</th><th>说明</th></tr></thead><tbody><tr><td><code>socket</code></td><td><code>/tmp/armd.sock</code></td><td>兼容字段：未配 listen 时等价 listen=[unix:&lt;socket&gt;]</td></tr><tr><td><code>listen</code></td><td><code>[]</code></td><td>监听地址数组：unix:&lt;path&gt; / tcp://host:port</td></tr><tr><td><code>token</code></td><td><code>null</code></td><td>可选访问令牌</td></tr><tr><td><code>identity</code></td><td><code>/tmp/armd-identity.json 或 /run/armd/identity.json</code></td><td>身份文件路径</td></tr><tr><td><code>arms[].id</code></td><td><code>—</code></td><td>对外 arm id，建议 &lt;robot&gt;:&lt;role&gt;</td></tr><tr><td><code>arms[].port</code></td><td><code>—</code></td><td>串口设备路径（sim=true 可空）</td></tr><tr><td><code>arms[].baud</code></td><td><code>1000000</code></td><td>波特率</td></tr><tr><td><code>arms[].poll_hz</code></td><td><code>60</code></td><td>轮询频率</td></tr><tr><td><code>arms[].motors</code></td><td><code>[1,2,3,4,5,6]</code></td><td>轮询的舵机 id</td></tr><tr><td><code>arms[].poll_addr</code></td><td><code>132（未显式配置且 stall_protection=true 时自动用 128）</code></td><td>轮询寄存器地址。显式配置后维持旧语义（把读到的值当 Present_Position），velocity 未知 → 堵转检测自动跳过</td></tr><tr><td><code>arms[].poll_len</code></td><td><code>4（未显式配置且 stall_protection=true 时自动用 8）</code></td><td>轮询寄存器长度。默认安全配置下单次 sync_read 读 addr=128/len=8（Present_Velocity + Present_Position），只多 4 字节/电机</td></tr><tr><td><code>arms[].monitor</code></td><td><code>False</code></td><td>每秒读电压/温度（寄存器 144/146）</td></tr><tr><td><code>arms[].joint_names</code></td><td><code>{}</code></td><td>舵机 id→关节名，标定档案与角度换算必需</td></tr><tr><td><code>arms[].profile</code></td><td><code>~/.config/armd/profiles/&lt;arm-id&gt;.json</code></td><td>标定档案路径</td></tr><tr><td><code>arms[].sim</code></td><td><code>False</code></td><td>仿真臂（arm.sim.inject 仅对 sim 臂可用）</td></tr><tr><td><code>arms[].reconnect_sec</code></td><td><code>2.0</code></td><td>断线重连间隔</td></tr><tr><td><code>arms[].read_timeout_ms</code></td><td><code>30</code></td><td>单次 sync_read 超时</td></tr><tr><td><code>arms[].stall_protection</code></td><td><code>True</code></td><td>堵转/限位保护总开关（最后一道防线，建议保持开启）</td></tr><tr><td><code>arms[].stall_timeout_ms</code></td><td><code>400</code></td><td>Goal-Present 偏差 + 静止条件持续多久触发堵转保护（建议 300–500）</td></tr><tr><td><code>arms[].stall_tolerance</code></td><td><code>60</code></td><td>判定堵转的 |Goal-Present| 阈值（counts）</td></tr><tr><td><code>arms[].stall_velocity_epsilon</code></td><td><code>2</code></td><td>视为静止的 |Present_Velocity| 阈值（X 系列单位 0.229rpm）</td></tr><tr><td><code>arms[].auto_torque_off</code></td><td><code>True</code></td><td>堵转触发时自动对故障电机 torque OFF</td></tr><tr><td><code>arms[].stall_recover_margin</code></td><td><code>20</code></td><td>堵转回退目标离 EEPROM 限位内侧的余量（counts）</td></tr><tr><td><code>arms[].stall_exclude_motors</code></td><td><code>[]</code></td><td>不参与堵转自动保护的电机（shipped configs 用 [6] 排除夹爪：夹住物体时 Goal-Present 长期有偏差属正常）</td></tr><tr><td><code>arms[].soft_limits</code></td><td><code>True</code></td><td>写 Goal_Position(116) 时做软限位；按 Operating_Mode：mode 3/未知用 0..4095 + EEPROM Min/Max，mode 4 只用 ±1,048,575 绝对范围（主臂为 mode 4）</td></tr><tr><td><code>arms[].soft_limit_mode</code></td><td><code>&quot;clamp&quot;</code></td><td>&quot;clamp&quot;（夹紧+返回警告，默认）或 &quot;reject&quot;（返回 soft_limit 错误）</td></tr><tr><td><code>arms[].soft_limit_margin</code></td><td><code>10</code></td><td>软限位内侧余量（counts）</td></tr></tbody></table></div>
   </section>
 
   <section class="block" id="protocol">
@@ -230,14 +261,14 @@ sudo cat /run/armd/identity.json</code></pre>
        <b>JSON-RPC 2.0</b>：兼容 JSON-RPC 2.0：请求带 &quot;jsonrpc&quot;:&quot;2.0&quot; 时响应也带。</p>
     <h3>请求 / 响应 / 错误</h3>
     <pre class="code"><code>→ {&quot;id&quot;: 7, &quot;method&quot;: &quot;arm.state&quot;, &quot;params&quot;: {&quot;arm&quot;: &quot;koch_v1_1:follower&quot;}}</code></pre>
-    <pre class="code"><code>← {&quot;id&quot;: 7, &quot;result&quot;: {&quot;seq&quot;: 123, &quot;connected&quot;: true, &quot;joints&quot;: {&quot;1&quot;: 1511}, &quot;deg&quot;: {&quot;shoulder_pan&quot;: 43.24}}}</code></pre>
+    <pre class="code"><code>← {&quot;id&quot;: 7, &quot;result&quot;: {&quot;seq&quot;: 123, &quot;connected&quot;: true, &quot;joints&quot;: {&quot;1&quot;: 1511}, &quot;deg&quot;: {&quot;shoulder_pan&quot;: 43.24}, &quot;torque&quot;: {&quot;1&quot;: true}, &quot;goals&quot;: {&quot;1&quot;: 1511}, &quot;stalls&quot;: {}, &quot;motor_errors&quot;: {}, &quot;safety&quot;: {&quot;stall_protection&quot;: true, &quot;stall_timeout_ms&quot;: 400, &quot;stall_tolerance&quot;: 60, &quot;auto_torque_off&quot;: true, &quot;soft_limits&quot;: true, &quot;stall_exclude_motors&quot;: [6]}}}</code></pre>
     <pre class="code"><code>← {&quot;id&quot;: 7, &quot;error&quot;: {&quot;code&quot;: &quot;no_such_arm&quot;, &quot;message&quot;: &quot;unknown arm &#x27;x&#x27;&quot;}}</code></pre>
     <p class="muted">请求不带 id 也可（单向命令），但写操作建议带 id 等确认。</p>
   </section>
 
   <section class="block" id="methods">
     <h2>RPC 方法</h2>
-    <div class="table-wrap"><table><thead><tr><th>方法</th><th>说明</th></tr></thead><tbody><tr><td><a href="#m-ping"><code>ping</code></a></td><td>健康检查。</td></tr><tr><td><a href="#m-hello"><code>hello</code></a></td><td>鉴权握手（配置了 token 时必需）。</td></tr><tr><td><a href="#m-info"><code>info</code></a></td><td>守护进程信息。</td></tr><tr><td><a href="#m-arm-list"><code>arm.list</code></a></td><td>所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/stats。</td></tr><tr><td><a href="#m-arm-state"><code>arm.state</code></a></td><td>读状态缓存，不占总线。deg 只在有 profile 时出现。</td></tr><tr><td><a href="#m-arm-read"><code>arm.read</code></a></td><td>立刻 sync_read 一次（占用总线），用于即时取值/标定采点。</td></tr><tr><td><a href="#m-arm-read_register"><code>arm.read_register</code></a></td><td>读任意控制表寄存器（小端有符号解析）。</td></tr><tr><td><a href="#m-arm-write_register"><code>arm.write_register</code></a></td><td>写任意寄存器（等舵机状态包确认）。</td></tr><tr><td><a href="#m-arm-sync_write"><code>arm.sync_write</code></a></td><td>同步写多个舵机（广播式，不等回包）。</td></tr><tr><td><a href="#m-arm-torque"><code>arm.torque</code></a></td><td>扭矩开关（写 Torque_Enable=64）。</td></tr><tr><td><a href="#m-arm-ping"><code>arm.ping</code></a></td><td>单舵机 ping，返回 model number。</td></tr><tr><td><a href="#m-arm-set_rate"><code>arm.set_rate</code></a></td><td>改轮询频率。</td></tr><tr><td><a href="#m-arm-reconnect"><code>arm.reconnect</code></a></td><td>强制重开串口（排查用）。</td></tr><tr><td><a href="#m-arm-stats"><code>arm.stats</code></a></td><td>计数器。</td></tr><tr><td><a href="#m-arm-profile-get"><code>arm.profile.get</code></a></td><td>读取标定档案。</td></tr><tr><td><a href="#m-arm-profile-set"><code>arm.profile.set</code></a></td><td>校验并持久化档案（覆盖前自动留历史快照）。</td></tr><tr><td><a href="#m-arm-profile-history"><code>arm.profile.history</code></a></td><td>历史快照列表（保留最近 20 份）。</td></tr><tr><td><a href="#m-arm-profile-restore"><code>arm.profile.restore</code></a></td><td>从历史快照恢复。</td></tr><tr><td><a href="#m-arm-profile-delete"><code>arm.profile.delete</code></a></td><td>删除档案。</td></tr><tr><td><a href="#m-arm-calibration-snapshot"><code>arm.calibration.snapshot</code></a></td><td>标定采点用：当前 raw（按关节名）+角度+健康，不占总线。</td></tr><tr><td><a href="#m-sub-subscribe"><code>sub.subscribe</code></a></td><td>订阅状态流。rate&gt;=54 时直通每个轮询帧；更低频率按时间抽帧。</td></tr><tr><td><a href="#m-sub-unsubscribe"><code>sub.unsubscribe</code></a></td><td>退订。</td></tr><tr><td><a href="#m-sub-rate"><code>sub.rate</code></a></td><td>改订阅频率。</td></tr></tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>方法</th><th>说明</th></tr></thead><tbody><tr><td><a href="#m-ping"><code>ping</code></a></td><td>健康检查。</td></tr><tr><td><a href="#m-hello"><code>hello</code></a></td><td>鉴权握手（配置了 token 时必需）。</td></tr><tr><td><a href="#m-info"><code>info</code></a></td><td>守护进程信息。</td></tr><tr><td><a href="#m-arm-list"><code>arm.list</code></a></td><td>所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/motor_errors/stalls/stats。</td></tr><tr><td><a href="#m-arm-state"><code>arm.state</code></a></td><td>读状态缓存，不占总线。deg 只在有 profile 时出现。v0.2.0 新增安全层字段（velocity/goals/torque/limits/motor_errors/stalls/safety）。</td></tr><tr><td><a href="#m-arm-read"><code>arm.read</code></a></td><td>立刻 sync_read 一次（占用总线），用于即时取值/标定采点。v0.2.0 起按电机返回硬件 error（errors），单电机故障不再整次失败。</td></tr><tr><td><a href="#m-arm-read_register"><code>arm.read_register</code></a></td><td>读任意控制表寄存器（小端有符号解析）。</td></tr><tr><td><a href="#m-arm-write_register"><code>arm.write_register</code></a></td><td>写任意寄存器（等舵机状态包确认）。写 Goal_Position(116) 时先过软限位：clamp 模式夹紧并返回 clamped/warnings；reject 模式返回 soft_limit 错误。</td></tr><tr><td><a href="#m-arm-sync_write"><code>arm.sync_write</code></a></td><td>同步写多个舵机（广播式，不等回包）。Goal_Position(116) 同样过软限位，clamped 为按电机的对象；reject 模式任一电机越界即整体拒绝（soft_limit）。</td></tr><tr><td><a href="#m-arm-torque"><code>arm.torque</code></a></td><td>扭矩开关（写 Torque_Enable=64）。enable=true 时清除该电机 stall 标记；写成功后 state.torque 与 goal 跟踪同步更新。</td></tr><tr><td><a href="#m-arm-torque_off"><code>arm.torque_off</code></a></td><td>按电机 torque OFF 的便捷方法（等价 arm.torque enable=false，默认全部电机）。应急卸力矩用。</td></tr><tr><td><a href="#m-arm-reboot"><code>arm.reboot</code></a></td><td>发 Dynamixel Reboot(0x08) 清除 latched 硬件错误（如 0x80 hardware_alert）；默认全部 motors。reboot 后 RAM 复位：torque=false、goal 清空、重新读 limits/position。等待最长 5s。</td></tr><tr><td><a href="#m-arm-clear_error"><code>arm.clear_error</code></a></td><td>只清 armd 侧 motor_errors/stalls 标记 + 读 Hardware_Error_Status(70)。若硬件仍报错（latched），warnings 会提示用 arm.reboot；不替代 reboot。</td></tr><tr><td><a href="#m-arm-sim-inject"><code>arm.sim.inject</code></a></td><td>仅仿真臂的故障注入：stall（顶住该电机）/ hardware_error（回 error=0x80 直到 reboot）/ no_response（完全不应答）/ transport_error（整条总线读写返回传输错误，模拟 USB 掉线，用于验证「先释放 fd 再重连」）/ clear（清除全部注入）。真机臂返回 not_sim。</td></tr><tr><td><a href="#m-arm-ping"><code>arm.ping</code></a></td><td>单舵机 ping，返回 model number。硬件 error 位会转 serial_error 并在 motor_errors 里标记该电机。</td></tr><tr><td><a href="#m-arm-set_rate"><code>arm.set_rate</code></a></td><td>改轮询频率。</td></tr><tr><td><a href="#m-arm-reconnect"><code>arm.reconnect</code></a></td><td>强制关串口再重开（排查用）。v0.2.0 保证先 close 旧 fd 再 open，不再出现 Device or resource busy。</td></tr><tr><td><a href="#m-arm-stats"><code>arm.stats</code></a></td><td>计数器。v0.2.0 新增 stalls/torque_offs/opens/closes。fd 不变量：connected 期间恰好 1 个 live 串口句柄，即 opens - closes == 1；worker 关闭/断线释放 fd 后二者相等。</td></tr><tr><td><a href="#m-arm-profile-get"><code>arm.profile.get</code></a></td><td>读取标定档案。</td></tr><tr><td><a href="#m-arm-profile-set"><code>arm.profile.set</code></a></td><td>校验并持久化档案（覆盖前自动留历史快照）。</td></tr><tr><td><a href="#m-arm-profile-history"><code>arm.profile.history</code></a></td><td>历史快照列表（保留最近 20 份）。</td></tr><tr><td><a href="#m-arm-profile-restore"><code>arm.profile.restore</code></a></td><td>从历史快照恢复。</td></tr><tr><td><a href="#m-arm-profile-delete"><code>arm.profile.delete</code></a></td><td>删除档案。</td></tr><tr><td><a href="#m-arm-calibration-snapshot"><code>arm.calibration.snapshot</code></a></td><td>标定采点用：当前 raw（按关节名）+角度+健康，不占总线。</td></tr><tr><td><a href="#m-sub-subscribe"><code>sub.subscribe</code></a></td><td>订阅状态流。rate&gt;=54 时直通每个轮询帧；更低频率按时间抽帧。</td></tr><tr><td><a href="#m-sub-unsubscribe"><code>sub.unsubscribe</code></a></td><td>退订。</td></tr><tr><td><a href="#m-sub-rate"><code>sub.rate</code></a></td><td>改订阅频率。</td></tr></tbody></table></div>
     
 <section class="method" id="m-ping">
   <h3><code>ping</code></h3>
@@ -278,42 +309,56 @@ sudo cat /run/armd/identity.json</code></pre>
 </section>
 <section class="method" id="m-arm-list">
   <h3><code>arm.list</code></h3>
-  <p>所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/stats。</p>
+  <p>所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/motor_errors/stalls/stats。</p>
   <h4>参数</h4>
   <p class="muted">无</p>
   <h4>返回</h4>
   <pre class="code"><code>{
-  &quot;[arm]&quot;: &quot;见 arm.state&quot;
+  &quot;[arm]&quot;: &quot;见 arm.state&quot;,
+  &quot;additional&quot;: &quot;每项新增 motor_errors/stalls 摘要（v0.2.0）&quot;
 }</code></pre>
 </section>
 <section class="method" id="m-arm-state">
   <h3><code>arm.state</code></h3>
-  <p>读状态缓存，不占总线。deg 只在有 profile 时出现。</p>
+  <p>读状态缓存，不占总线。deg 只在有 profile 时出现。v0.2.0 新增安全层字段（velocity/goals/torque/limits/motor_errors/stalls/safety）。</p>
   <h4>参数</h4>
   <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
   <h4>返回</h4>
   <pre class="code"><code>{
   &quot;seq&quot;: &quot;int&quot;,
   &quot;ts&quot;: &quot;int ms&quot;,
-  &quot;connected&quot;: &quot;bool&quot;,
-  &quot;joints&quot;: &quot;{motor_id: raw}&quot;,
+  &quot;connected&quot;: &quot;bool（单电机错误不影响，保持 true）&quot;,
+  &quot;joints&quot;: &quot;{motor_id: raw}（多圈关节/主臂 mode 4 可超出 0..4095，如 6133 / -2889）&quot;,
+  &quot;velocity&quot;: &quot;{motor_id: raw}（轮询窗口不含 velocity 时为空；多圈关节同样可超出 0..4095）&quot;,
   &quot;deg&quot;: &quot;{joint: deg}&quot;,
   &quot;joint_names&quot;: &quot;{motor_id: joint}&quot;,
   &quot;health&quot;: &quot;{motor_id: {voltage, temp}}&quot;,
   &quot;hz&quot;: &quot;float&quot;,
   &quot;read_us&quot;: &quot;int&quot;,
-  &quot;error&quot;: &quot;str|null&quot;,
-  &quot;profile_saved_at&quot;: &quot;int|null&quot;
+  &quot;error&quot;: &quot;str|null（仅整臂/传输层错误）&quot;,
+  &quot;motor_errors&quot;: &quot;{motor_id: {code:int|null, names:[str], message:str, ts:int, since_ms:int}}&quot;,
+  &quot;stalls&quot;: &quot;{motor_id: {motor, reason, position, goal, stall_ms, ts, torque_off, action, reverted_goal}}&quot;,
+  &quot;torque&quot;: &quot;{motor_id: bool}（已知才出现）&quot;,
+  &quot;limits&quot;: &quot;{motor_id: {min, max}}（EEPROM，读到才出现）&quot;,
+  &quot;goals&quot;: &quot;{motor_id: raw}（armd 最后接受的目标，软限位后）&quot;,
+  &quot;safety&quot;: &quot;{stall_protection, stall_timeout_ms, stall_tolerance, auto_torque_off, soft_limits, stall_exclude_motors}&quot;,
+  &quot;profile_saved_at&quot;: &quot;int|null&quot;,
+  &quot;arm&quot;: &quot;str&quot;,
+  &quot;port&quot;: &quot;str&quot;,
+  &quot;sim&quot;: &quot;bool&quot;,
+  &quot;poll_addr&quot;: &quot;int&quot;,
+  &quot;motors&quot;: &quot;[u8]&quot;
 }</code></pre>
 </section>
 <section class="method" id="m-arm-read">
   <h3><code>arm.read</code></h3>
-  <p>立刻 sync_read 一次（占用总线），用于即时取值/标定采点。</p>
+  <p>立刻 sync_read 一次（占用总线），用于即时取值/标定采点。v0.2.0 起按电机返回硬件 error（errors），单电机故障不再整次失败。</p>
   <h4>参数</h4>
   <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motors</code></td><td>[u8] · 可选</td></tr><tr><td><code>timeout_ms</code></td><td>int · 可选 · 默认 50</td></tr></tbody></table></div>
   <h4>返回</h4>
   <pre class="code"><code>{
-  &quot;positions&quot;: &quot;{motor_id: raw}&quot;
+  &quot;positions&quot;: &quot;{motor_id: raw}&quot;,
+  &quot;errors&quot;: &quot;{motor_id: error_byte}&quot;
 }</code></pre>
 </section>
 <section class="method" id="m-arm-read_register">
@@ -324,42 +369,105 @@ sudo cat /run/armd/identity.json</code></pre>
   <h4>返回</h4>
   <pre class="code"><code>{
   &quot;data&quot;: &quot;[u8]&quot;,
-  &quot;value&quot;: &quot;int&quot;
+  &quot;value&quot;: &quot;int&quot;,
+  &quot;model&quot;: &quot;int|null（预留）&quot;
 }</code></pre>
 </section>
 <section class="method" id="m-arm-write_register">
   <h3><code>arm.write_register</code></h3>
-  <p>写任意寄存器（等舵机状态包确认）。</p>
+  <p>写任意寄存器（等舵机状态包确认）。写 Goal_Position(116) 时先过软限位：clamp 模式夹紧并返回 clamped/warnings；reject 模式返回 soft_limit 错误。</p>
   <h4>参数</h4>
   <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motor</code></td><td>u8</td></tr><tr><td><code>address</code></td><td>u16</td></tr><tr><td><code>length</code></td><td>u16</td></tr><tr><td><code>value</code></td><td>int</td></tr></tbody></table></div>
   <h4>返回</h4>
   <pre class="code"><code>{
-  &quot;ok&quot;: &quot;bool&quot;
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;applied&quot;: &quot;int|null（Goal 写入时经软限位后的实际下发值）&quot;,
+  &quot;clamped&quot;: &quot;{requested, applied, min, max}|null&quot;,
+  &quot;warnings&quot;: &quot;[str]&quot;
 }</code></pre>
 </section>
 <section class="method" id="m-arm-sync_write">
   <h3><code>arm.sync_write</code></h3>
-  <p>同步写多个舵机（广播式，不等回包）。</p>
+  <p>同步写多个舵机（广播式，不等回包）。Goal_Position(116) 同样过软限位，clamped 为按电机的对象；reject 模式任一电机越界即整体拒绝（soft_limit）。</p>
   <h4>参数</h4>
   <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>address</code></td><td>u16</td></tr><tr><td><code>length</code></td><td>u16</td></tr><tr><td><code>values</code></td><td>{motor_id: value}</td></tr></tbody></table></div>
   <h4>返回</h4>
   <pre class="code"><code>{
-  &quot;ok&quot;: &quot;bool&quot;
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;clamped&quot;: &quot;{motor_id: {requested, applied, min, max}}&quot;,
+  &quot;warnings&quot;: &quot;[str]&quot;,
+  &quot;torque&quot;: &quot;{motor_id: bool}（写 Torque_Enable 时）&quot;
 }</code></pre>
 </section>
 <section class="method" id="m-arm-torque">
   <h3><code>arm.torque</code></h3>
-  <p>扭矩开关（写 Torque_Enable=64）。</p>
+  <p>扭矩开关（写 Torque_Enable=64）。enable=true 时清除该电机 stall 标记；写成功后 state.torque 与 goal 跟踪同步更新。</p>
   <h4>参数</h4>
   <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>enable</code></td><td>bool</td></tr><tr><td><code>motors</code></td><td>[u8] · 可选</td></tr></tbody></table></div>
   <h4>返回</h4>
   <pre class="code"><code>{
-  &quot;ok&quot;: &quot;bool&quot;
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;torque&quot;: &quot;{motor_id: bool}&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-torque_off">
+  <h3><code>arm.torque_off</code></h3>
+  <p>按电机 torque OFF 的便捷方法（等价 arm.torque enable=false，默认全部电机）。应急卸力矩用。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motors</code></td><td>[u8] · 可选</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;torque&quot;: &quot;{motor_id: bool}&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-reboot">
+  <h3><code>arm.reboot</code></h3>
+  <p>发 Dynamixel Reboot(0x08) 清除 latched 硬件错误（如 0x80 hardware_alert）；默认全部 motors。reboot 后 RAM 复位：torque=false、goal 清空、重新读 limits/position。等待最长 5s。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motors</code></td><td>[u8] · 可选</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;rebooted&quot;: &quot;[u8]&quot;,
+  &quot;failed&quot;: &quot;[u8]&quot;,
+  &quot;errors&quot;: &quot;{motor_id: str}（Reboot 指令本身失败的电机）&quot;,
+  &quot;failures&quot;: &quot;{motor_id: str}（重启后 ping 仍失败的原因）&quot;,
+  &quot;torque&quot;: &quot;{motor_id: bool}&quot;,
+  &quot;limits&quot;: &quot;{motor_id: {min, max}}&quot;,
+  &quot;warnings&quot;: &quot;[str]&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-clear_error">
+  <h3><code>arm.clear_error</code></h3>
+  <p>只清 armd 侧 motor_errors/stalls 标记 + 读 Hardware_Error_Status(70)。若硬件仍报错（latched），warnings 会提示用 arm.reboot；不替代 reboot。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motors</code></td><td>[u8] · 可选</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;cleared&quot;: &quot;[u8]&quot;,
+  &quot;hardware_error_status&quot;: &quot;{motor_id: u8}&quot;,
+  &quot;warnings&quot;: &quot;[str]&quot;
+}</code></pre>
+</section>
+<section class="method" id="m-arm-sim-inject">
+  <h3><code>arm.sim.inject</code></h3>
+  <p>仅仿真臂的故障注入：stall（顶住该电机）/ hardware_error（回 error=0x80 直到 reboot）/ no_response（完全不应答）/ transport_error（整条总线读写返回传输错误，模拟 USB 掉线，用于验证「先释放 fd 再重连」）/ clear（清除全部注入）。真机臂返回 not_sim。</p>
+  <h4>参数</h4>
+  <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>kind</code></td><td>str（stall|hardware_error|no_response|transport_error|clear）</td></tr><tr><td><code>motors</code></td><td>[u8] · 可选</td></tr><tr><td><code>enable</code></td><td>bool · 可选 · 默认 True</td></tr></tbody></table></div>
+  <h4>返回</h4>
+  <pre class="code"><code>{
+  &quot;ok&quot;: &quot;bool&quot;,
+  &quot;kind&quot;: &quot;str&quot;,
+  &quot;motors&quot;: &quot;[u8]&quot;,
+  &quot;enable&quot;: &quot;bool&quot;,
+  &quot;sim&quot;: true
 }</code></pre>
 </section>
 <section class="method" id="m-arm-ping">
   <h3><code>arm.ping</code></h3>
-  <p>单舵机 ping，返回 model number。</p>
+  <p>单舵机 ping，返回 model number。硬件 error 位会转 serial_error 并在 motor_errors 里标记该电机。</p>
   <h4>参数</h4>
   <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr><tr><td><code>motor</code></td><td>u8</td></tr></tbody></table></div>
   <h4>返回</h4>
@@ -380,7 +488,7 @@ sudo cat /run/armd/identity.json</code></pre>
 </section>
 <section class="method" id="m-arm-reconnect">
   <h3><code>arm.reconnect</code></h3>
-  <p>强制重开串口（排查用）。</p>
+  <p>强制关串口再重开（排查用）。v0.2.0 保证先 close 旧 fd 再 open，不再出现 Device or resource busy。</p>
   <h4>参数</h4>
   <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
   <h4>返回</h4>
@@ -390,7 +498,7 @@ sudo cat /run/armd/identity.json</code></pre>
 </section>
 <section class="method" id="m-arm-stats">
   <h3><code>arm.stats</code></h3>
-  <p>计数器。</p>
+  <p>计数器。v0.2.0 新增 stalls/torque_offs/opens/closes。fd 不变量：connected 期间恰好 1 个 live 串口句柄，即 opens - closes == 1；worker 关闭/断线释放 fd 后二者相等。</p>
   <h4>参数</h4>
   <div class="table-wrap"><table><thead><tr><th>参数</th><th>类型</th></tr></thead><tbody><tr><td><code>arm</code></td><td>str</td></tr></tbody></table></div>
   <h4>返回</h4>
@@ -402,7 +510,11 @@ sudo cat /run/armd/identity.json</code></pre>
   &quot;frames_dropped&quot;: &quot;int&quot;,
   &quot;reconnects&quot;: &quot;int&quot;,
   &quot;urgent_queued&quot;: &quot;int&quot;,
-  &quot;normal_queued&quot;: &quot;int&quot;
+  &quot;normal_queued&quot;: &quot;int&quot;,
+  &quot;stalls&quot;: &quot;int（堵转触发次数）&quot;,
+  &quot;torque_offs&quot;: &quot;int（安全层自动/手动 torque off 次数）&quot;,
+  &quot;opens&quot;: &quot;int（串口 open 次数）&quot;,
+  &quot;closes&quot;: &quot;int（串口 close 次数）&quot;
 }</code></pre>
 </section>
 <section class="method" id="m-arm-profile-get">
@@ -514,7 +626,7 @@ sudo cat /run/armd/identity.json</code></pre>
     <p>订阅后服务端按 <code>rate_hz</code> 推送；帧里 <code>sub</code> 是订阅 id。
     <code>event:"state"</code> 为周期状态，<code>event:"arm"</code> 为连接状态变化。</p>
     <section class="event"><h3><code>state</code></h3>
-    <p>周期状态帧。</p><pre class="code"><code>{
+    <p>周期状态帧。v0.2.0 在原有字段上增加 velocity/motor_errors/stalls/torque/limits/goals/safety。</p><pre class="code"><code>{
   &quot;event&quot;: &quot;\&quot;state\&quot;&quot;,
   &quot;sub&quot;: &quot;int&quot;,
   &quot;arm&quot;: &quot;str&quot;,
@@ -523,15 +635,53 @@ sudo cat /run/armd/identity.json</code></pre>
   &quot;connected&quot;: &quot;bool&quot;,
   &quot;hz&quot;: &quot;float&quot;,
   &quot;joints&quot;: &quot;{motor_id: raw}&quot;,
+  &quot;velocity&quot;: &quot;{motor_id: raw}&quot;,
   &quot;deg&quot;: &quot;{joint: deg}&quot;,
-  &quot;health&quot;: &quot;{motor_id: {voltage, temp}}&quot;
+  &quot;health&quot;: &quot;{motor_id: {voltage, temp}}&quot;,
+  &quot;torque&quot;: &quot;{motor_id: bool}&quot;,
+  &quot;limits&quot;: &quot;{motor_id: {min, max}}&quot;,
+  &quot;goals&quot;: &quot;{motor_id: raw}&quot;,
+  &quot;motor_errors&quot;: &quot;{motor_id: {code, names, message, ts, since_ms}}&quot;,
+  &quot;stalls&quot;: &quot;{motor_id: {motor, reason, position, goal, stall_ms, ts, torque_off, action, reverted_goal}}&quot;,
+  &quot;safety&quot;: &quot;{stall_protection, stall_timeout_ms, stall_tolerance, auto_torque_off, soft_limits, stall_exclude_motors}&quot;
 }</code></pre></section><section class="event"><h3><code>arm</code></h3>
-    <p>连接状态变化事件（掉线/恢复）。</p><pre class="code"><code>{
+    <p>连接状态变化事件（掉线/恢复）。单电机 error 不触发此事件。</p><pre class="code"><code>{
   &quot;event&quot;: &quot;\&quot;arm\&quot;&quot;,
   &quot;sub&quot;: &quot;int&quot;,
   &quot;arm&quot;: &quot;str&quot;,
   &quot;connected&quot;: &quot;bool&quot;,
   &quot;error&quot;: &quot;str|null&quot;,
+  &quot;ts&quot;: &quot;int ms&quot;
+}</code></pre></section><section class="event"><h3><code>stall</code></h3>
+    <p>堵转保护触发（每电机只发一次，重新使能/新目标/clear_error 后清除）。</p><pre class="code"><code>{
+  &quot;event&quot;: &quot;\&quot;stall\&quot;&quot;,
+  &quot;sub&quot;: &quot;int&quot;,
+  &quot;arm&quot;: &quot;str&quot;,
+  &quot;motor&quot;: &quot;u8&quot;,
+  &quot;reason&quot;: &quot;\&quot;stall\&quot;&quot;,
+  &quot;position&quot;: &quot;int raw（触发时位置）&quot;,
+  &quot;goal&quot;: &quot;int raw（触发时的目标）&quot;,
+  &quot;stall_ms&quot;: &quot;int&quot;,
+  &quot;torque_off&quot;: &quot;bool&quot;,
+  &quot;action&quot;: &quot;\&quot;torque_off+goal_revert\&quot; | \&quot;goal_revert\&quot;&quot;,
+  &quot;reverted_goal&quot;: &quot;int（回退后的目标）&quot;,
+  &quot;ts&quot;: &quot;int ms&quot;
+}</code></pre></section><section class="event"><h3><code>motor_error</code></h3>
+    <p>单电机硬件 error 或连续无响应首次出现。不影响整臂 connected。</p><pre class="code"><code>{
+  &quot;event&quot;: &quot;\&quot;motor_error\&quot;&quot;,
+  &quot;sub&quot;: &quot;int&quot;,
+  &quot;arm&quot;: &quot;str&quot;,
+  &quot;motor&quot;: &quot;u8&quot;,
+  &quot;code&quot;: &quot;u8|null（null=连续无响应）&quot;,
+  &quot;names&quot;: &quot;[str]（hardware_alert / no_response / ...）&quot;,
+  &quot;message&quot;: &quot;str&quot;,
+  &quot;ts&quot;: &quot;int ms&quot;
+}</code></pre></section><section class="event"><h3><code>motor_recovered</code></h3>
+    <p>该电机故障清除（重新读到数据 / reboot / clear_error 后）。</p><pre class="code"><code>{
+  &quot;event&quot;: &quot;\&quot;motor_recovered\&quot;&quot;,
+  &quot;sub&quot;: &quot;int&quot;,
+  &quot;arm&quot;: &quot;str&quot;,
+  &quot;motor&quot;: &quot;u8&quot;,
   &quot;ts&quot;: &quot;int ms&quot;
 }</code></pre></section>
   </section>
@@ -574,6 +724,14 @@ time.sleep(1)
 print(&quot;frames/s ≈&quot;, len(frames))
 c.unsubscribe(sub)
 
+# 安全层（v0.2.0）
+print(c.safety(&quot;koch_v1_1:follower&quot;))               # stalls / motor_errors / torque / limits / goals / safety
+print(c.state(&quot;koch_v1_1:follower&quot;)[&quot;motor_errors&quot;])
+c.torque_off(&quot;koch_v1_1:follower&quot;)                  # 应急卸力矩（可传 motors=[3]）
+c.reboot(&quot;koch_v1_1:follower&quot;, motors=[3])          # Dynamixel Reboot(0x08) 清 latched 0x80
+c.clear_error(&quot;koch_v1_1:follower&quot;)                 # 清 armd 侧 error/stall 标记
+# c.sim_inject(&quot;koch_v1_1:follower&quot;, &quot;stall&quot;, motors=[3])  # 仅 sim 臂：stall/hardware_error/no_response/clear
+
 # 标定档案
 prof = c.profile(&quot;koch_v1_1:follower&quot;)[&quot;profile&quot;]
 c.set_profile(&quot;koch_v1_1:follower&quot;, prof)          # 覆盖前 armd 自动留历史
@@ -600,12 +758,18 @@ python3 clients/python/armd_client.py --socket /tmp/armd.sock watch   koch_v1_1:
 python3 clients/python/armd_client.py --socket /tmp/armd.sock torque  koch_v1_1:follower 0
 python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:follower
 python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:follower --history
-python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1:follower</code></pre>
+python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1:follower
+# v0.2.0 安全层 / 故障恢复
+python3 clients/python/armd_client.py --socket /tmp/armd.sock safety        koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd.sock torque-off    koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd.sock reboot        koch_v1_1:follower --motors 3
+python3 clients/python/armd_client.py --socket /tmp/armd.sock clear-error   koch_v1_1:follower
+python3 clients/python/armd_client.py --socket /tmp/armd-sim.sock sim-inject sim stall --motors 3</code></pre>
   </section>
 
   <section class="block" id="errors">
     <h2>错误码</h2>
-    <div class="table-wrap"><table><thead><tr><th>错误码</th><th>含义</th></tr></thead><tbody><tr><td><code>bad_request</code></td><td>参数缺失/类型错误/校验失败</td></tr><tr><td><code>no_such_arm</code></td><td>arm id 不存在（可用 arm.list 查询）</td></tr><tr><td><code>no_such_sub</code></td><td>订阅 id 不存在</td></tr><tr><td><code>unknown_method</code></td><td>未知方法</td></tr><tr><td><code>queue_full</code></td><td>urgent/normal 队列满，客户端应退避重试</td></tr><tr><td><code>timeout</code></td><td>worker 未在期限内回复（总线可能卡住）</td></tr><tr><td><code>serial_error</code></td><td>串口/舵机错误（含舵机硬件 error 位）</td></tr><tr><td><code>io_error</code></td><td>本地文件读写失败（如 profile 写入）</td></tr><tr><td><code>unauthorized</code></td><td>已配置 token，但连接未先 hello</td></tr><tr><td><code>closed</code></td><td>客户端已关闭（客户端侧错误）</td></tr></tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>错误码</th><th>含义</th></tr></thead><tbody><tr><td><code>bad_request</code></td><td>参数缺失/类型错误/校验失败</td></tr><tr><td><code>no_such_arm</code></td><td>arm id 不存在（可用 arm.list 查询）</td></tr><tr><td><code>no_such_sub</code></td><td>订阅 id 不存在</td></tr><tr><td><code>unknown_method</code></td><td>未知方法</td></tr><tr><td><code>queue_full</code></td><td>urgent/normal 队列满，客户端应退避重试</td></tr><tr><td><code>timeout</code></td><td>worker 未在期限内回复（总线可能卡住；arm.reboot 最长等 5s）</td></tr><tr><td><code>serial_error</code></td><td>串口/舵机错误。v0.2.0 起单电机硬件 error 不再导致整次读失败（只记入 state.motor_errors），这里只剩传输层/整臂错误</td></tr><tr><td><code>soft_limit</code></td><td>soft_limit_mode=&quot;reject&quot; 时写入的 Goal_Position 超出软限位，整次写入被拒绝</td></tr><tr><td><code>not_sim</code></td><td>arm.sim.inject 用在了非仿真臂（sim=false）上</td></tr><tr><td><code>io_error</code></td><td>本地文件读写失败（如 profile 写入）</td></tr><tr><td><code>unauthorized</code></td><td>已配置 token，但连接未先 hello</td></tr><tr><td><code>closed</code></td><td>客户端已关闭（客户端侧错误）</td></tr></tbody></table></div>
   </section>
 
   <section class="block" id="faq">
@@ -613,6 +777,26 @@ python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1
     <h3>启动失败：另一个 armd 已经持有 …lock</h3>
     <p>单实例锁 <code>&lt;socket&gt;.lock</code> 被占用。先确认没有在跑的 armd（<code>pgrep -fl armd</code>）；
     锁文件本身不需要删除（进程退出内核自动释放）。</p>
+    <h3>Device or resource busy / 串口 fd 泄漏</h3>
+    <p>这是 v0.1.0 事故的根因（详见 <code>docs/INCIDENT-2026-11-22.md</code>）：读失败后旧 fd 未释放，
+    TIOCEXCL 让再次 open 永远 EBUSY。v0.2.0 已修：<code>Link</code> 保证 open 前先 close，读失败 3 次先释放 fd 再重连。
+    <b>处置</b>：升级 v0.2.0 → <code>arm.reconnect</code>（立即 close 再 open）→ 仍 busy 用
+    <code>lsof /dev/cu.usbmodem*</code> 确认没有其它进程（如 zeropose 直连）占用；插拔 USB 后 armd 会自动重连。
+    fd 不变量：connected 期间 <code>stats.opens - stats.closes == 1</code>，断线释放后二者相等。</p>
+    <h3>舵机报 latched 硬件错误 0x80（hardware_alert）</h3>
+    <p>典型是堵转/顶住限位后舵机 latch 的错误，普通重连不会清除。
+    用 <code>arm.reboot</code>（Dynamixel Reboot 0x08，最长 5s）清除；<code>arm.clear_error</code> 只清 armd 侧标记，
+    若 <code>hardware_error_status</code> 仍非 0，warnings 会提示必须 reboot/断电。详见 <a href="#safety">安全层</a>。</p>
+    <h3>收到 event:"stall" / state.stalls 有记录</h3>
+    <p>堵转保护已触发：该电机 torque OFF + goal 回退到限位内侧。先排除机械卡死/限位/负载问题，
+    再给安全的新目标（写入即清除该电机 stall 标记）并 <code>arm.torque(enable=true)</code>。
+    夹爪夹住物体时 Goal-Present 长期有偏差属正常——已在 shipped configs 用
+    <code>stall_exclude_motors: [6]</code> 排除，不要靠关掉 <code>stall_protection</code> 解决反复触发。</p>
+    <h3>单个舵机不动，但其它电机/订阅正常</h3>
+    <p>v0.2.0 起单电机故障被隔离：看 <code>arm.list[].motor_errors</code> / <code>arm.state.motor_errors</code>。
+    <code>code=128</code> 是 latched 硬件错误（用 <code>arm.reboot</code>）；
+    <code>code=null</code> / names 含 <code>no_response</code> 是连续 ≥10 次读不到（检查供电/线缆/ID）。
+    <code>connected</code> 仍为 true 是预期行为，不再整臂掉线。</p>
     <h3>macOS：进程刚起就被 SIGKILL（Code Signature Invalid）</h3>
     <p>拷贝过的二进制需要重签：<code>codesign --force --sign - ~/.local/bin/armd</code>；用 <code>scripts/deploy-macos.sh</code> 可避免。</p>
     <h3>Linux 板子：舵机全都不响应</h3>
@@ -633,17 +817,16 @@ python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1
   <section class="block" id="changelog">
     <h2>版本与兼容</h2>
     <ul>
-      <li><b>v0.1.0</b>（2026-11-22）：JSON-RPC 2.0 兼容、token 鉴权、Unix+TCP 双传输、
-      标定档案 profile + 历史快照/恢复、电压/温度监控、ARM 交叉编译产物。</li>
+      <li><b>v0.2.0</b>（2026-11-22）：安全层：堵转保护（400ms 默认，torque OFF + goal 回退 + 事件）、Operating_Mode 感知软限位（mode 3 用 0..4095+EEPROM 限位，mode 4 用 ±1,048,575 绝对范围；clamp/reject）、单电机故障隔离（per-motor errors，connected 保持 true）；新增 RPC：arm.reboot / arm.clear_error / arm.torque_off / arm.sim.inject；arm.read 带 errors；write/sync_write 带 clamped/warnings；新增事件：stall / motor_error / motor_recovered；state 帧新增 velocity/goals/torque/limits/motor_errors/stalls/safety；stats 新增 stalls/torque_offs/opens/closes；串口 fd 生命周期修复：open 前先 close，连续读失败先释放 fd 再重连，断线不再 100% CPU 自旋（事故根因）；新增配置：stall_* / soft_limit_* / stall_exclude_motors（默认即安全，旧配置兼容）。</li><li><b>v0.1.0</b>（2026-11）：JSON-RPC 2.0 兼容、token 鉴权、Unix+TCP 双传输；标定档案 profile + 历史快照/恢复；电压/温度监控、ARM 交叉编译产物；订阅限流、单实例锁 + identity 文件。</li>
       <li>协议稳定性：方法名/字段只增不改；新增可选字段老客户端可忽略。</li>
       <li>机器可读规范：<code>docs/api.json</code>（本页由它生成：<code>python3 scripts/gen-armd-doc.py</code>）。</li>
     </ul>
-    <footer>armd v0.1.0 · 生成于 2026-11-22 21:38 ·
+    <footer>armd v0.2.0 · 生成于 2026-11-23 00:13 ·
     仓库 Gogs <code>adam/armd</code> / GitHub <code>ColdZoo/armd</code></footer>
   </section>
 </main>
 </div>
-<script type="application/json" id="armd-api">{"name": "armd", "version": "0.1.0", "updated": "2026-11-22", "summary": "Dynamixel 机械臂串口守护进程：独占串口总线，对上层提供 NDJSON RPC 与发布订阅；持有标定档案（profile）。", "transport": {"unix": "/tmp/armd.sock（macOS/Linux 本机；权限 0600）", "tcp": "tcp://host:8771（下位机/网络场景，配置 listen 里开启）", "framing": "NDJSON：一行一个 JSON。请求/响应用 id 配对；推送帧带 event 字段、无 id。", "auth": "配置 token 后，客户端必须先发 hello 带 token，否则所有方法返回 unauthorized。", "jsonrpc": "兼容 JSON-RPC 2.0：请求带 \"jsonrpc\":\"2.0\" 时响应也带。"}, "request_example": {"id": 7, "method": "arm.state", "params": {"arm": "koch_v1_1:follower"}}, "response_example": {"id": 7, "result": {"seq": 123, "connected": true, "joints": {"1": 1511}, "deg": {"shoulder_pan": 43.24}}}, "error_example": {"id": 7, "error": {"code": "no_such_arm", "message": "unknown arm 'x'"}}, "errors": [{"code": "bad_request", "meaning": "参数缺失/类型错误/校验失败"}, {"code": "no_such_arm", "meaning": "arm id 不存在（可用 arm.list 查询）"}, {"code": "no_such_sub", "meaning": "订阅 id 不存在"}, {"code": "unknown_method", "meaning": "未知方法"}, {"code": "queue_full", "meaning": "urgent/normal 队列满，客户端应退避重试"}, {"code": "timeout", "meaning": "worker 未在期限内回复（总线可能卡住）"}, {"code": "serial_error", "meaning": "串口/舵机错误（含舵机硬件 error 位）"}, {"code": "io_error", "meaning": "本地文件读写失败（如 profile 写入）"}, {"code": "unauthorized", "meaning": "已配置 token，但连接未先 hello"}, {"code": "closed", "meaning": "客户端已关闭（客户端侧错误）"}], "methods": [{"name": "ping", "params": [], "result": {"pong": "bool", "version": "str", "uptime_sec": "int"}, "desc": "健康检查。"}, {"name": "hello", "params": [{"name": "token", "type": "str", "optional": true}], "result": {"ok": "bool", "auth_required": "bool", "version": "str"}, "desc": "鉴权握手（配置了 token 时必需）。"}, {"name": "info", "params": [], "result": {"version": "str", "uptime_sec": "int", "socket": "str", "arms": "[str]"}, "desc": "守护进程信息。"}, {"name": "arm.list", "params": [], "result": {"[arm]": "见 arm.state"}, "desc": "所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/stats。"}, {"name": "arm.state", "params": [{"name": "arm", "type": "str"}], "result": {"seq": "int", "ts": "int ms", "connected": "bool", "joints": "{motor_id: raw}", "deg": "{joint: deg}", "joint_names": "{motor_id: joint}", "health": "{motor_id: {voltage, temp}}", "hz": "float", "read_us": "int", "error": "str|null", "profile_saved_at": "int|null"}, "desc": "读状态缓存，不占总线。deg 只在有 profile 时出现。"}, {"name": "arm.read", "params": [{"name": "arm", "type": "str"}, {"name": "motors", "type": "[u8]", "optional": true}, {"name": "timeout_ms", "type": "int", "optional": true, "default": 50}], "result": {"positions": "{motor_id: raw}"}, "desc": "立刻 sync_read 一次（占用总线），用于即时取值/标定采点。"}, {"name": "arm.read_register", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}], "result": {"data": "[u8]", "value": "int"}, "desc": "读任意控制表寄存器（小端有符号解析）。"}, {"name": "arm.write_register", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}, {"name": "value", "type": "int"}], "result": {"ok": "bool"}, "desc": "写任意寄存器（等舵机状态包确认）。"}, {"name": "arm.sync_write", "params": [{"name": "arm", "type": "str"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}, {"name": "values", "type": "{motor_id: value}"}], "result": {"ok": "bool"}, "desc": "同步写多个舵机（广播式，不等回包）。"}, {"name": "arm.torque", "params": [{"name": "arm", "type": "str"}, {"name": "enable", "type": "bool"}, {"name": "motors", "type": "[u8]", "optional": true}], "result": {"ok": "bool"}, "desc": "扭矩开关（写 Torque_Enable=64）。"}, {"name": "arm.ping", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}], "result": {"model": "int"}, "desc": "单舵机 ping，返回 model number。"}, {"name": "arm.set_rate", "params": [{"name": "arm", "type": "str"}, {"name": "hz", "type": "float (0.5~500)"}], "result": {"ok": "bool", "hz": "float"}, "desc": "改轮询频率。"}, {"name": "arm.reconnect", "params": [{"name": "arm", "type": "str"}], "result": {"ok": "bool"}, "desc": "强制重开串口（排查用）。"}, {"name": "arm.stats", "params": [{"name": "arm", "type": "str"}], "result": {"polls": "int", "read_errors": "int", "writes": "int", "frames_published": "int", "frames_dropped": "int", "reconnects": "int", "urgent_queued": "int", "normal_queued": "int"}, "desc": "计数器。"}, {"name": "arm.profile.get", "params": [{"name": "arm", "type": "str"}], "result": {"profile": "profile|null", "path": "str", "has_profile": "bool"}, "desc": "读取标定档案。"}, {"name": "arm.profile.set", "params": [{"name": "arm", "type": "str"}, {"name": "profile", "type": "profile"}], "result": {"profile": "profile", "path": "str"}, "desc": "校验并持久化档案（覆盖前自动留历史快照）。"}, {"name": "arm.profile.history", "params": [{"name": "arm", "type": "str"}], "result": {"history": "[{name, savedAt}]", "dir": "str"}, "desc": "历史快照列表（保留最近 20 份）。"}, {"name": "arm.profile.restore", "params": [{"name": "arm", "type": "str"}, {"name": "name", "type": "str"}], "result": {"restored": "str", "profile": "profile"}, "desc": "从历史快照恢复。"}, {"name": "arm.profile.delete", "params": [{"name": "arm", "type": "str"}], "result": {"deleted": "bool"}, "desc": "删除档案。"}, {"name": "arm.calibration.snapshot", "params": [{"name": "arm", "type": "str"}], "result": {"raw": "{joint: raw}", "deg": "{joint: deg}", "seq": "int", "ts": "int", "connected": "bool", "health": "{motor_id: {voltage, temp}}"}, "desc": "标定采点用：当前 raw（按关节名）+角度+健康，不占总线。"}, {"name": "sub.subscribe", "params": [{"name": "arms", "type": "[str]", "optional": true}, {"name": "rate_hz", "type": "float", "optional": true, "default": 60}], "result": {"sub_id": "int", "rate_hz": "float", "arms": "[str]"}, "desc": "订阅状态流。rate>=54 时直通每个轮询帧；更低频率按时间抽帧。"}, {"name": "sub.unsubscribe", "params": [{"name": "sub_id", "type": "int"}], "result": {"ok": "bool"}, "desc": "退订。"}, {"name": "sub.rate", "params": [{"name": "sub_id", "type": "int"}, {"name": "rate_hz", "type": "float"}], "result": {"ok": "bool"}, "desc": "改订阅频率。"}], "events": [{"event": "state", "fields": {"event": "\"state\"", "sub": "int", "arm": "str", "seq": "int", "ts": "int ms", "connected": "bool", "hz": "float", "joints": "{motor_id: raw}", "deg": "{joint: deg}", "health": "{motor_id: {voltage, temp}}"}, "desc": "周期状态帧。"}, {"event": "arm", "fields": {"event": "\"arm\"", "sub": "int", "arm": "str", "connected": "bool", "error": "str|null", "ts": "int ms"}, "desc": "连接状态变化事件（掉线/恢复）。"}], "profile_schema": {"description": "标定档案：raw→URDF 关节角的换算参数。存在 ~/.config/armd/profiles/<arm-id>.json。", "fields": {"zero": "{joint: raw}", "sign": "{joint: 1|-1}", "grip": {"open": "int", "closed": "int", "angle": "float (5~140.5, 可选)"}, "spin": {"wrist_roll": "float (-180~180, 可选)"}, "savedAt": "int (unix 秒)"}, "formula": "非夹爪关节：deg = wrap(raw - zero) % 4096（折到 ±2048）× 360/4096 × sign；夹爪：deg = clamp((raw - closed)/(open - closed), 0, 1) × (angle 或 137.5)"}, "config_fields": [{"key": "socket", "default": "/tmp/armd.sock", "desc": "兼容字段：未配 listen 时等价 listen=[unix:<socket>]"}, {"key": "listen", "default": "[]", "desc": "监听地址数组：unix:<path> / tcp://host:port"}, {"key": "token", "default": "null", "desc": "可选访问令牌"}, {"key": "identity", "default": "/tmp/armd-identity.json 或 /run/armd/identity.json", "desc": "身份文件路径"}, {"key": "arms[].id", "desc": "对外 arm id，建议 <robot>:<role>"}, {"key": "arms[].port", "desc": "串口设备路径（sim=true 可空）"}, {"key": "arms[].baud", "default": 1000000, "desc": "波特率"}, {"key": "arms[].poll_hz", "default": 60, "desc": "轮询频率"}, {"key": "arms[].motors", "default": "[1,2,3,4,5,6]", "desc": "轮询的舵机 id"}, {"key": "arms[].monitor", "default": false, "desc": "每秒读电压/温度（寄存器 144/146）"}, {"key": "arms[].joint_names", "default": "{}", "desc": "舵机 id→关节名，标定档案与角度换算必需"}, {"key": "arms[].profile", "default": "~/.config/armd/profiles/<arm-id>.json", "desc": "标定档案路径"}, {"key": "arms[].sim", "default": false, "desc": "仿真臂"}, {"key": "arms[].reconnect_sec", "default": 2.0, "desc": "断线重连间隔"}, {"key": "arms[].read_timeout_ms", "default": 30, "desc": "单次 sync_read 超时"}], "packages": {"repo": "Gogs adam/armd, GitHub ColdZoo/armd, 本地 /raid/Projects/armd", "python_client": "clients/python/armd_client.py（纯标准库）", "cli": "python3 clients/python/armd_client.py --socket /tmp/armd.sock <info|arms|state|read|stats|watch|torque|write|profile|snapshot>"}}</script>
+<script type="application/json" id="armd-api">{"name": "armd", "version": "0.2.0", "updated": "2026-11-22", "summary": "Dynamixel 机械臂串口守护进程：独占串口总线，对上层提供 NDJSON RPC 与发布订阅；持有标定档案（profile）；v0.2.0 起内置安全层（堵转保护 / 软限位 / 单电机故障隔离）。", "transport": {"unix": "/tmp/armd.sock（macOS/Linux 本机；权限 0600）", "tcp": "tcp://host:8771（下位机/网络场景，配置 listen 里开启）", "framing": "NDJSON：一行一个 JSON。请求/响应用 id 配对；推送帧带 event 字段、无 id。", "auth": "配置 token 后，客户端必须先发 hello 带 token，否则所有方法返回 unauthorized。", "jsonrpc": "兼容 JSON-RPC 2.0：请求带 \"jsonrpc\":\"2.0\" 时响应也带。"}, "request_example": {"id": 7, "method": "arm.state", "params": {"arm": "koch_v1_1:follower"}}, "response_example": {"id": 7, "result": {"seq": 123, "connected": true, "joints": {"1": 1511}, "deg": {"shoulder_pan": 43.24}, "torque": {"1": true}, "goals": {"1": 1511}, "stalls": {}, "motor_errors": {}, "safety": {"stall_protection": true, "stall_timeout_ms": 400, "stall_tolerance": 60, "auto_torque_off": true, "soft_limits": true, "stall_exclude_motors": [6]}}}, "error_example": {"id": 7, "error": {"code": "no_such_arm", "message": "unknown arm 'x'"}}, "errors": [{"code": "bad_request", "meaning": "参数缺失/类型错误/校验失败"}, {"code": "no_such_arm", "meaning": "arm id 不存在（可用 arm.list 查询）"}, {"code": "no_such_sub", "meaning": "订阅 id 不存在"}, {"code": "unknown_method", "meaning": "未知方法"}, {"code": "queue_full", "meaning": "urgent/normal 队列满，客户端应退避重试"}, {"code": "timeout", "meaning": "worker 未在期限内回复（总线可能卡住；arm.reboot 最长等 5s）"}, {"code": "serial_error", "meaning": "串口/舵机错误。v0.2.0 起单电机硬件 error 不再导致整次读失败（只记入 state.motor_errors），这里只剩传输层/整臂错误"}, {"code": "soft_limit", "meaning": "soft_limit_mode=\"reject\" 时写入的 Goal_Position 超出软限位，整次写入被拒绝"}, {"code": "not_sim", "meaning": "arm.sim.inject 用在了非仿真臂（sim=false）上"}, {"code": "io_error", "meaning": "本地文件读写失败（如 profile 写入）"}, {"code": "unauthorized", "meaning": "已配置 token，但连接未先 hello"}, {"code": "closed", "meaning": "客户端已关闭（客户端侧错误）"}], "methods": [{"name": "ping", "params": [], "result": {"pong": "bool", "version": "str", "uptime_sec": "int"}, "desc": "健康检查。"}, {"name": "hello", "params": [{"name": "token", "type": "str", "optional": true}], "result": {"ok": "bool", "auth_required": "bool", "version": "str"}, "desc": "鉴权握手（配置了 token 时必需）。"}, {"name": "info", "params": [], "result": {"version": "str", "uptime_sec": "int", "socket": "str", "arms": "[str]"}, "desc": "守护进程信息。"}, {"name": "arm.list", "params": [], "result": {"[arm]": "见 arm.state", "additional": "每项新增 motor_errors/stalls 摘要（v0.2.0）"}, "desc": "所有机械臂摘要：id/label/port/sim/motors/connected/hz/seq/error/profile_saved_at/motor_errors/stalls/stats。"}, {"name": "arm.state", "params": [{"name": "arm", "type": "str"}], "result": {"seq": "int", "ts": "int ms", "connected": "bool（单电机错误不影响，保持 true）", "joints": "{motor_id: raw}（多圈关节/主臂 mode 4 可超出 0..4095，如 6133 / -2889）", "velocity": "{motor_id: raw}（轮询窗口不含 velocity 时为空；多圈关节同样可超出 0..4095）", "deg": "{joint: deg}", "joint_names": "{motor_id: joint}", "health": "{motor_id: {voltage, temp}}", "hz": "float", "read_us": "int", "error": "str|null（仅整臂/传输层错误）", "motor_errors": "{motor_id: {code:int|null, names:[str], message:str, ts:int, since_ms:int}}", "stalls": "{motor_id: {motor, reason, position, goal, stall_ms, ts, torque_off, action, reverted_goal}}", "torque": "{motor_id: bool}（已知才出现）", "limits": "{motor_id: {min, max}}（EEPROM，读到才出现）", "goals": "{motor_id: raw}（armd 最后接受的目标，软限位后）", "safety": "{stall_protection, stall_timeout_ms, stall_tolerance, auto_torque_off, soft_limits, stall_exclude_motors}", "profile_saved_at": "int|null", "arm": "str", "port": "str", "sim": "bool", "poll_addr": "int", "motors": "[u8]"}, "desc": "读状态缓存，不占总线。deg 只在有 profile 时出现。v0.2.0 新增安全层字段（velocity/goals/torque/limits/motor_errors/stalls/safety）。"}, {"name": "arm.read", "params": [{"name": "arm", "type": "str"}, {"name": "motors", "type": "[u8]", "optional": true}, {"name": "timeout_ms", "type": "int", "optional": true, "default": 50}], "result": {"positions": "{motor_id: raw}", "errors": "{motor_id: error_byte}"}, "desc": "立刻 sync_read 一次（占用总线），用于即时取值/标定采点。v0.2.0 起按电机返回硬件 error（errors），单电机故障不再整次失败。"}, {"name": "arm.read_register", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}], "result": {"data": "[u8]", "value": "int", "model": "int|null（预留）"}, "desc": "读任意控制表寄存器（小端有符号解析）。"}, {"name": "arm.write_register", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}, {"name": "value", "type": "int"}], "result": {"ok": "bool", "applied": "int|null（Goal 写入时经软限位后的实际下发值）", "clamped": "{requested, applied, min, max}|null", "warnings": "[str]"}, "desc": "写任意寄存器（等舵机状态包确认）。写 Goal_Position(116) 时先过软限位：clamp 模式夹紧并返回 clamped/warnings；reject 模式返回 soft_limit 错误。"}, {"name": "arm.sync_write", "params": [{"name": "arm", "type": "str"}, {"name": "address", "type": "u16"}, {"name": "length", "type": "u16"}, {"name": "values", "type": "{motor_id: value}"}], "result": {"ok": "bool", "clamped": "{motor_id: {requested, applied, min, max}}", "warnings": "[str]", "torque": "{motor_id: bool}（写 Torque_Enable 时）"}, "desc": "同步写多个舵机（广播式，不等回包）。Goal_Position(116) 同样过软限位，clamped 为按电机的对象；reject 模式任一电机越界即整体拒绝（soft_limit）。"}, {"name": "arm.torque", "params": [{"name": "arm", "type": "str"}, {"name": "enable", "type": "bool"}, {"name": "motors", "type": "[u8]", "optional": true}], "result": {"ok": "bool", "torque": "{motor_id: bool}"}, "desc": "扭矩开关（写 Torque_Enable=64）。enable=true 时清除该电机 stall 标记；写成功后 state.torque 与 goal 跟踪同步更新。"}, {"name": "arm.torque_off", "params": [{"name": "arm", "type": "str"}, {"name": "motors", "type": "[u8]", "optional": true}], "result": {"ok": "bool", "torque": "{motor_id: bool}"}, "desc": "按电机 torque OFF 的便捷方法（等价 arm.torque enable=false，默认全部电机）。应急卸力矩用。"}, {"name": "arm.reboot", "params": [{"name": "arm", "type": "str"}, {"name": "motors", "type": "[u8]", "optional": true}], "result": {"ok": "bool", "rebooted": "[u8]", "failed": "[u8]", "errors": "{motor_id: str}（Reboot 指令本身失败的电机）", "failures": "{motor_id: str}（重启后 ping 仍失败的原因）", "torque": "{motor_id: bool}", "limits": "{motor_id: {min, max}}", "warnings": "[str]"}, "desc": "发 Dynamixel Reboot(0x08) 清除 latched 硬件错误（如 0x80 hardware_alert）；默认全部 motors。reboot 后 RAM 复位：torque=false、goal 清空、重新读 limits/position。等待最长 5s。"}, {"name": "arm.clear_error", "params": [{"name": "arm", "type": "str"}, {"name": "motors", "type": "[u8]", "optional": true}], "result": {"ok": "bool", "cleared": "[u8]", "hardware_error_status": "{motor_id: u8}", "warnings": "[str]"}, "desc": "只清 armd 侧 motor_errors/stalls 标记 + 读 Hardware_Error_Status(70)。若硬件仍报错（latched），warnings 会提示用 arm.reboot；不替代 reboot。"}, {"name": "arm.sim.inject", "params": [{"name": "arm", "type": "str"}, {"name": "kind", "type": "str（stall|hardware_error|no_response|transport_error|clear）"}, {"name": "motors", "type": "[u8]", "optional": true}, {"name": "enable", "type": "bool", "optional": true, "default": true}], "result": {"ok": "bool", "kind": "str", "motors": "[u8]", "enable": "bool", "sim": true}, "desc": "仅仿真臂的故障注入：stall（顶住该电机）/ hardware_error（回 error=0x80 直到 reboot）/ no_response（完全不应答）/ transport_error（整条总线读写返回传输错误，模拟 USB 掉线，用于验证「先释放 fd 再重连」）/ clear（清除全部注入）。真机臂返回 not_sim。"}, {"name": "arm.ping", "params": [{"name": "arm", "type": "str"}, {"name": "motor", "type": "u8"}], "result": {"model": "int"}, "desc": "单舵机 ping，返回 model number。硬件 error 位会转 serial_error 并在 motor_errors 里标记该电机。"}, {"name": "arm.set_rate", "params": [{"name": "arm", "type": "str"}, {"name": "hz", "type": "float (0.5~500)"}], "result": {"ok": "bool", "hz": "float"}, "desc": "改轮询频率。"}, {"name": "arm.reconnect", "params": [{"name": "arm", "type": "str"}], "result": {"ok": "bool"}, "desc": "强制关串口再重开（排查用）。v0.2.0 保证先 close 旧 fd 再 open，不再出现 Device or resource busy。"}, {"name": "arm.stats", "params": [{"name": "arm", "type": "str"}], "result": {"polls": "int", "read_errors": "int", "writes": "int", "frames_published": "int", "frames_dropped": "int", "reconnects": "int", "urgent_queued": "int", "normal_queued": "int", "stalls": "int（堵转触发次数）", "torque_offs": "int（安全层自动/手动 torque off 次数）", "opens": "int（串口 open 次数）", "closes": "int（串口 close 次数）"}, "desc": "计数器。v0.2.0 新增 stalls/torque_offs/opens/closes。fd 不变量：connected 期间恰好 1 个 live 串口句柄，即 opens - closes == 1；worker 关闭/断线释放 fd 后二者相等。"}, {"name": "arm.profile.get", "params": [{"name": "arm", "type": "str"}], "result": {"profile": "profile|null", "path": "str", "has_profile": "bool"}, "desc": "读取标定档案。"}, {"name": "arm.profile.set", "params": [{"name": "arm", "type": "str"}, {"name": "profile", "type": "profile"}], "result": {"profile": "profile", "path": "str"}, "desc": "校验并持久化档案（覆盖前自动留历史快照）。"}, {"name": "arm.profile.history", "params": [{"name": "arm", "type": "str"}], "result": {"history": "[{name, savedAt}]", "dir": "str"}, "desc": "历史快照列表（保留最近 20 份）。"}, {"name": "arm.profile.restore", "params": [{"name": "arm", "type": "str"}, {"name": "name", "type": "str"}], "result": {"restored": "str", "profile": "profile"}, "desc": "从历史快照恢复。"}, {"name": "arm.profile.delete", "params": [{"name": "arm", "type": "str"}], "result": {"deleted": "bool"}, "desc": "删除档案。"}, {"name": "arm.calibration.snapshot", "params": [{"name": "arm", "type": "str"}], "result": {"raw": "{joint: raw}", "deg": "{joint: deg}", "seq": "int", "ts": "int", "connected": "bool", "health": "{motor_id: {voltage, temp}}"}, "desc": "标定采点用：当前 raw（按关节名）+角度+健康，不占总线。"}, {"name": "sub.subscribe", "params": [{"name": "arms", "type": "[str]", "optional": true}, {"name": "rate_hz", "type": "float", "optional": true, "default": 60}], "result": {"sub_id": "int", "rate_hz": "float", "arms": "[str]"}, "desc": "订阅状态流。rate>=54 时直通每个轮询帧；更低频率按时间抽帧。"}, {"name": "sub.unsubscribe", "params": [{"name": "sub_id", "type": "int"}], "result": {"ok": "bool"}, "desc": "退订。"}, {"name": "sub.rate", "params": [{"name": "sub_id", "type": "int"}, {"name": "rate_hz", "type": "float"}], "result": {"ok": "bool"}, "desc": "改订阅频率。"}], "events": [{"event": "state", "fields": {"event": "\"state\"", "sub": "int", "arm": "str", "seq": "int", "ts": "int ms", "connected": "bool", "hz": "float", "joints": "{motor_id: raw}", "velocity": "{motor_id: raw}", "deg": "{joint: deg}", "health": "{motor_id: {voltage, temp}}", "torque": "{motor_id: bool}", "limits": "{motor_id: {min, max}}", "goals": "{motor_id: raw}", "motor_errors": "{motor_id: {code, names, message, ts, since_ms}}", "stalls": "{motor_id: {motor, reason, position, goal, stall_ms, ts, torque_off, action, reverted_goal}}", "safety": "{stall_protection, stall_timeout_ms, stall_tolerance, auto_torque_off, soft_limits, stall_exclude_motors}"}, "desc": "周期状态帧。v0.2.0 在原有字段上增加 velocity/motor_errors/stalls/torque/limits/goals/safety。"}, {"event": "arm", "fields": {"event": "\"arm\"", "sub": "int", "arm": "str", "connected": "bool", "error": "str|null", "ts": "int ms"}, "desc": "连接状态变化事件（掉线/恢复）。单电机 error 不触发此事件。"}, {"event": "stall", "fields": {"event": "\"stall\"", "sub": "int", "arm": "str", "motor": "u8", "reason": "\"stall\"", "position": "int raw（触发时位置）", "goal": "int raw（触发时的目标）", "stall_ms": "int", "torque_off": "bool", "action": "\"torque_off+goal_revert\" | \"goal_revert\"", "reverted_goal": "int（回退后的目标）", "ts": "int ms"}, "desc": "堵转保护触发（每电机只发一次，重新使能/新目标/clear_error 后清除）。"}, {"event": "motor_error", "fields": {"event": "\"motor_error\"", "sub": "int", "arm": "str", "motor": "u8", "code": "u8|null（null=连续无响应）", "names": "[str]（hardware_alert / no_response / ...）", "message": "str", "ts": "int ms"}, "desc": "单电机硬件 error 或连续无响应首次出现。不影响整臂 connected。"}, {"event": "motor_recovered", "fields": {"event": "\"motor_recovered\"", "sub": "int", "arm": "str", "motor": "u8", "ts": "int ms"}, "desc": "该电机故障清除（重新读到数据 / reboot / clear_error 后）。"}], "safety": {"title": "安全层（v0.2.0，三道防线）", "intro": "2026-11-22 事故：从臂肘部（motor 3，XL430/XL330）顶住机械限位持续输出力矩 → 舵机 latch hardware error 0x80 → follower worker 读失败/重连 → 串口 fd 未释放，Device or resource busy 无法恢复，只能重启 armd + 物理断电。事故记录见 docs/INCIDENT-2026-11-22.md，冻结规范见 docs/SAFETY-DESIGN.md。v0.2.0 把「不把机械臂顶坏、不让单电机拖垮整臂、不泄漏串口 fd」固化为三道防线。", "guardrails": [{"name": "① 堵转保护（最后一道防线）", "trigger": "每电机 StallTracker：|goal - present| > stall_tolerance(60) 且 |velocity| <= stall_velocity_epsilon(2) 且 torque_on，持续 stall_timeout_ms(400)；stall_exclude_motors 里的电机跳过", "action": "只对该电机：先 sync_write Torque_Enable=0（auto_torque_off=true 时，默认开）→ goal 回退到 present 附近（夹到 [min+stall_recover_margin, max-stall_recover_margin]）→ state.stalls + stats.stalls + event:\"stall\"；同臂其他电机完全不受影响", "observe": "arm.state.stalls / event:\"stall\"；arm.read_register(motor, 64, 1) 应读到 0；不会产生 0x80", "defaults": "stall_protection=true, stall_timeout_ms=400, stall_tolerance=60, stall_velocity_epsilon=2, auto_torque_off=true, stall_recover_margin=20, stall_exclude_motors=[]（建议夹爪填 [6]）"}, {"name": "② 软限位（写 Goal 前拦截）", "trigger": "写 Goal_Position(116)（arm.write_register / arm.sync_write）且 soft_limits=true；生效范围由该电机的 Operating_Mode(11) 决定", "action": "位置模式(mode 3) 或模式未知：先夹到绝对范围 0..=4095，再按 EEPROM Min/Max Position Limit 夹到 [min+soft_limit_margin, max-soft_limit_margin]；扩展位置模式(mode 4)：只夹到绝对范围 ±1,048,575，不套 EEPROM Min/Max（它只适用于单圈位置模式，否则多圈目标会被错误夹住）。clamp 模式（默认）下发夹紧值并回 clamped/warnings；reject 模式返回 soft_limit 错误、不下发", "observe": "mode 3 下 arm.write_register(116, 5000) → applied=4095-margin 或 soft_limit 错误；mode 4（主臂）允许负值/>4095 的多圈目标；写成功清除该电机 stall 标记。worker 连接时读 Operating_Mode 并每秒刷新、跟踪对 addr 11 的写入（遥操作启动时把从臂切到 3）", "defaults": "soft_limits=true, soft_limit_mode=\"clamp\", soft_limit_margin=10"}, {"name": "③ 单电机故障隔离 + 串口 fd 生命周期", "trigger": "某个舵机状态包 error 位非 0（如 0x80）或连续 ≥10 次轮询无响应", "action": "sync_read 按电机返回 {data, errors}，单电机 error 只写 motor_errors[id]（事件 motor_error），connected 保持 true、其他电机正常；故障恢复自动清除并发 motor_recovered；Link 保证 open 前先 close 旧句柄、读失败 3 次先 close 再重连，打开失败时 io=None，绝不占着 fd 再 open", "observe": "arm.list[].motor_errors / arm.state.motor_errors；fd 不变量：connected 期间 opens - closes == 1（恰好一个 live 串口句柄），断线释放后二者相等；arm.reconnect ×20 后 lsof 每设备仍只有 1 个 fd；用 sim.inject transport_error 可验证断线后 fd 先释放", "defaults": "无需配置；connected 语义见 arm.state.connected"}], "recovery_flows": [{"title": "latched 硬件错误（0x80 hardware_alert）恢复", "steps": ["arm.list 或 arm.state 确认 motor_errors[电机].code == 128（names 含 hardware_alert），记下电机 id", "arm.state.stalls 查看是否由堵转触发；排查机械卡死/限位/NFS 等外部原因", "arm.reboot(motors=[该电机]) —— Dynamixel Reboot(0x08) 清除 latched 错误（最长等 5s；成功时 torque 自动置 false）", "arm.clear_error(motors=[该电机]) 只清 armd 侧标记；若 hardware_error_status 仍非 0，warnings 会提示必须 reboot/断电", "确认 motor_errors 已空、connected=true 后，再 arm.torque(enable=true) 恢复使能（或重新写目标）"]}, {"title": "堵转触发后恢复", "steps": ["arm.state.stalls[电机] 看 position/goal/stall_ms/reverted_goal；event:\"stall\" 可实时发现", "排除机械卡死：手动活动关节、检查线缆/限位/负载，确认不是软件目标导致顶死", "需要继续动作时：先给安全的新目标（arm.write_register 116 或 arm.sync_write，会先过软限位），或在应用里把目标收回到可达范围", "target 更新成功后该电机 stall 标记自动清除；再 arm.torque(enable=true) 重新使能", "反复触发说明负载/限位/标定参数有问题，不要简单关掉 stall_protection"]}, {"title": "串口 Device or resource busy / fd 泄漏（事故根因）", "steps": ["v0.1.0 中读失败后旧 fd 不释放、再次 open 永远 EBUSY（lsof 可见每设备多 fd）。升级 v0.2.0 后该根因已修复", "现场处置：升级 armd → arm.reconnect（先 close 再 open，fd 立即释放）→ 仍 busy 时用 lsof /dev/cu.usbmodem* 确认没有其它进程占用（zeropose 直连等）", "设备节点消失/仅剩旧 fd：unplug 后重新插上，armd 会自动重连；用 arm.stats.opens/closes 判断是否有泄漏：connected 期间差值为 1（恰好一个 live 句柄），断线释放后二者相等；差值 >1 才说明泄漏", "latched 0x80 不会因重连消失，必须 arm.reboot 或物理断电；连不上总线时 arm.list.error 会给出 open 错误"]}], "hardware_error_bits": [{"mask": "0x80", "name": "hardware_alert", "meaning": "硬件告警（典型：堵转/过载导致的 latched 错误），需 arm.reboot 清除"}, {"mask": "0x20", "name": "overload", "meaning": "过载"}, {"mask": "0x10", "name": "electrical_shock", "meaning": "电气冲击"}, {"mask": "0x08", "name": "motor_encoder", "meaning": "电机/编码器异常"}, {"mask": "0x04", "name": "overheating", "meaning": "过温"}, {"mask": "0x01", "name": "input_voltage", "meaning": "输入电压异常"}, {"mask": "其他位", "name": "reserved_bit_N", "meaning": "保留位，按位名上报"}], "defaults": [{"field": "stall_protection", "default": "true", "meaning": "堵转保护总开关"}, {"field": "stall_timeout_ms", "default": "400", "meaning": "条件持续多久触发（建议 300–500）"}, {"field": "stall_tolerance", "default": "60", "meaning": "|Goal-Present| 偏差阈值（counts）"}, {"field": "stall_velocity_epsilon", "default": "2", "meaning": "视为静止的 |Present_Velocity| 阈值（X 系列单位 0.229rpm）"}, {"field": "auto_torque_off", "default": "true", "meaning": "触发时自动对故障电机 torque OFF"}, {"field": "stall_recover_margin", "default": "20", "meaning": "回退目标离 EEPROM 限位内侧的余量（counts）"}, {"field": "stall_exclude_motors", "default": "[]（shipped configs：\"[6]\"）", "meaning": "不参与堵转自动保护的电机；建议把夹爪（6）排除：夹住物体时 Goal-Present 长期有偏差属正常，否则会误触发"}, {"field": "soft_limits", "default": "true", "meaning": "写 Goal_Position 时用 EEPROM Min/Max Position Limit 做软限位"}, {"field": "soft_limit_mode", "default": "\"clamp\"", "meaning": "clamp=夹紧+警告；reject=返回 soft_limit 错误"}, {"field": "soft_limit_margin", "default": "10", "meaning": "软限位内侧余量（counts）"}], "notes": ["堵转检测依赖轮询窗口里的 Present_Velocity。poll_addr 未显式配置且 stall_protection=true 时，poll 窗口自动用 addr=128、len=8（一次 sync_read 同时读 velocity+position，只多 4 字节/电机）；显式配置 poll_addr/poll_len 时维持旧语义，velocity 未知 → 堵转检测自动跳过并打一条警告日志。", "arm.read/arm.state 的 errors 是「该电机状态包带 error 位」，不是传输失败；完全没响应的电机不出现在 data/errors 中，连续 ≥10 次（约 167ms@60Hz）标记 no_response。", "夹住物体时夹爪的电机会持续存在 Goal-Present 偏差且 velocity≈0，属正常保持而非堵转。用 stall_exclude_motors 把夹爪（如 6）排除出堵转自动保护；本仓库 configs/koch*.json 已写 [6]。事故中的 motor 3（肘部）不在排除列表里。", "软限位按 Operating_Mode(11) 生效：位置模式(mode 3) 用 EEPROM Min/Max 且绝对 0..4095；扩展位置模式(mode 4) 只做 ±1,048,575 绝对范围，不套 EEPROM 限位（主臂真实电机是 mode 4）。worker 连接时读 Operating_Mode，每秒刷新并跟踪对 addr 11 的写入（遥操作启动时会把从臂切到 3）。", "多圈关节（主臂 mode 4）的 state.joints / state.velocity / goals 可以超出 0..4095（实测 pan 6133、roll -2889），这是正常的多圈位置，不是坏值；换算角度时由 profile 的 wrap 逻辑处理。", "fd 不变量：connected 期间恰好有 1 个 live 串口句柄，即 stats.opens - stats.closes == 1；worker 关闭/断线释放 fd 后两者相等。arm.sim.inject 的 transport_error 往整条总线注入传输错误（模拟 USB 掉线），worker 连续 3 次传输失败后先 close 释放 fd 再按 reconnect_sec 重连，可用于验证释放路径；清除注入后恢复。", "所有新配置项均可省略（serde default），旧 v0.1.0 配置无需改动；旧客户端可忽略新增字段。"]}, "changelog": [{"version": "0.2.0", "date": "2026-11-22", "items": ["安全层：堵转保护（400ms 默认，torque OFF + goal 回退 + 事件）、Operating_Mode 感知软限位（mode 3 用 0..4095+EEPROM 限位，mode 4 用 ±1,048,575 绝对范围；clamp/reject）、单电机故障隔离（per-motor errors，connected 保持 true）", "新增 RPC：arm.reboot / arm.clear_error / arm.torque_off / arm.sim.inject；arm.read 带 errors；write/sync_write 带 clamped/warnings", "新增事件：stall / motor_error / motor_recovered；state 帧新增 velocity/goals/torque/limits/motor_errors/stalls/safety；stats 新增 stalls/torque_offs/opens/closes", "串口 fd 生命周期修复：open 前先 close，连续读失败先释放 fd 再重连，断线不再 100% CPU 自旋（事故根因）", "新增配置：stall_* / soft_limit_* / stall_exclude_motors（默认即安全，旧配置兼容）"]}, {"version": "0.1.0", "date": "2026-11", "items": ["JSON-RPC 2.0 兼容、token 鉴权、Unix+TCP 双传输", "标定档案 profile + 历史快照/恢复", "电压/温度监控、ARM 交叉编译产物", "订阅限流、单实例锁 + identity 文件"]}], "profile_schema": {"description": "标定档案：raw→URDF 关节角的换算参数。存在 ~/.config/armd/profiles/<arm-id>.json。", "fields": {"zero": "{joint: raw}", "sign": "{joint: 1|-1}", "grip": {"open": "int", "closed": "int", "angle": "float (5~140.5, 可选)"}, "spin": {"wrist_roll": "float (-180~180, 可选)"}, "savedAt": "int (unix 秒)"}, "formula": "非夹爪关节：deg = wrap(raw - zero) % 4096（折到 ±2048）× 360/4096 × sign；夹爪：deg = clamp((raw - closed)/(open - closed), 0, 1) × (angle 或 137.5)"}, "config_fields": [{"key": "socket", "default": "/tmp/armd.sock", "desc": "兼容字段：未配 listen 时等价 listen=[unix:<socket>]"}, {"key": "listen", "default": "[]", "desc": "监听地址数组：unix:<path> / tcp://host:port"}, {"key": "token", "default": "null", "desc": "可选访问令牌"}, {"key": "identity", "default": "/tmp/armd-identity.json 或 /run/armd/identity.json", "desc": "身份文件路径"}, {"key": "arms[].id", "desc": "对外 arm id，建议 <robot>:<role>"}, {"key": "arms[].port", "desc": "串口设备路径（sim=true 可空）"}, {"key": "arms[].baud", "default": 1000000, "desc": "波特率"}, {"key": "arms[].poll_hz", "default": 60, "desc": "轮询频率"}, {"key": "arms[].motors", "default": "[1,2,3,4,5,6]", "desc": "轮询的舵机 id"}, {"key": "arms[].poll_addr", "default": "132（未显式配置且 stall_protection=true 时自动用 128）", "desc": "轮询寄存器地址。显式配置后维持旧语义（把读到的值当 Present_Position），velocity 未知 → 堵转检测自动跳过"}, {"key": "arms[].poll_len", "default": "4（未显式配置且 stall_protection=true 时自动用 8）", "desc": "轮询寄存器长度。默认安全配置下单次 sync_read 读 addr=128/len=8（Present_Velocity + Present_Position），只多 4 字节/电机"}, {"key": "arms[].monitor", "default": false, "desc": "每秒读电压/温度（寄存器 144/146）"}, {"key": "arms[].joint_names", "default": "{}", "desc": "舵机 id→关节名，标定档案与角度换算必需"}, {"key": "arms[].profile", "default": "~/.config/armd/profiles/<arm-id>.json", "desc": "标定档案路径"}, {"key": "arms[].sim", "default": false, "desc": "仿真臂（arm.sim.inject 仅对 sim 臂可用）"}, {"key": "arms[].reconnect_sec", "default": 2.0, "desc": "断线重连间隔"}, {"key": "arms[].read_timeout_ms", "default": 30, "desc": "单次 sync_read 超时"}, {"key": "arms[].stall_protection", "default": true, "desc": "堵转/限位保护总开关（最后一道防线，建议保持开启）"}, {"key": "arms[].stall_timeout_ms", "default": 400, "desc": "Goal-Present 偏差 + 静止条件持续多久触发堵转保护（建议 300–500）"}, {"key": "arms[].stall_tolerance", "default": 60, "desc": "判定堵转的 |Goal-Present| 阈值（counts）"}, {"key": "arms[].stall_velocity_epsilon", "default": 2, "desc": "视为静止的 |Present_Velocity| 阈值（X 系列单位 0.229rpm）"}, {"key": "arms[].auto_torque_off", "default": true, "desc": "堵转触发时自动对故障电机 torque OFF"}, {"key": "arms[].stall_recover_margin", "default": 20, "desc": "堵转回退目标离 EEPROM 限位内侧的余量（counts）"}, {"key": "arms[].stall_exclude_motors", "default": "[]", "desc": "不参与堵转自动保护的电机（shipped configs 用 [6] 排除夹爪：夹住物体时 Goal-Present 长期有偏差属正常）"}, {"key": "arms[].soft_limits", "default": true, "desc": "写 Goal_Position(116) 时做软限位；按 Operating_Mode：mode 3/未知用 0..4095 + EEPROM Min/Max，mode 4 只用 ±1,048,575 绝对范围（主臂为 mode 4）"}, {"key": "arms[].soft_limit_mode", "default": "\"clamp\"", "desc": "\"clamp\"（夹紧+返回警告，默认）或 \"reject\"（返回 soft_limit 错误）"}, {"key": "arms[].soft_limit_margin", "default": 10, "desc": "软限位内侧余量（counts）"}], "packages": {"repo": "Gogs adam/armd, GitHub ColdZoo/armd, 本地 /raid/Projects/armd", "python_client": "clients/python/armd_client.py（纯标准库；ArmdClient 支持 auto_reconnect 自动重连+重订阅）", "cli": "python3 clients/python/armd_client.py --socket /tmp/armd.sock <info|arms|state|read|stats|watch|torque|write|profile|snapshot|reboot|clear-error|torque-off|safety|sim-inject>"}}</script>
 <script>
   // 侧边栏 TOC 高亮
   const links = [...document.querySelectorAll('.toc a')];
