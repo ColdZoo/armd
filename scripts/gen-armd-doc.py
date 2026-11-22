@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 API = json.loads((ROOT / "docs" / "api.json").read_text(encoding="utf-8"))
 OUT = ROOT / "docs" / "armd.html"
+OUT_MD = ROOT / "docs" / "armd-api.md"
 
 
 def esc(x) -> str:
@@ -499,6 +500,86 @@ python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1
 </html>
 '''
 
+def render_markdown() -> str:
+    """KB 友好版（纯 Markdown）：OpenViking 语义检索/其他 agent 直接读。"""
+    lines = [
+        f"# armd API 参考（v{API['version']}，更新 {API['updated']}）",
+        "",
+        API["summary"],
+        "",
+        "> 完整 HTML 文档（含架构/安装/排障/示例）：`viking://resources/armd/armd.html`；",
+        "> 本机文档站 http://127.0.0.1:8790/ ｜局域网 http://air.my:8790/ ｜机器可读规范 `viking://resources/armd/api.json`",
+        "",
+        "## 传输",
+        "",
+        f"- Unix socket：{API['transport']['unix']}",
+        f"- TCP：{API['transport']['tcp']}",
+        f"- 帧格式：{API['transport']['framing']}",
+        f"- 鉴权：{API['transport']['auth']}",
+        f"- JSON-RPC：{API['transport']['jsonrpc']}",
+        "",
+        "## 请求 / 响应示例",
+        "",
+        "```json",
+        json.dumps(API["request_example"], ensure_ascii=False),
+        "```",
+        "",
+        "```json",
+        json.dumps(API["response_example"], ensure_ascii=False),
+        "```",
+        "",
+        "错误响应：",
+        "",
+        "```json",
+        json.dumps(API["error_example"], ensure_ascii=False),
+        "```",
+        "",
+        "## 方法总览",
+        "",
+        "| 方法 | 说明 |",
+        "|---|---|",
+    ]
+    for m in API["methods"]:
+        lines.append(f"| `{m['name']}` | {m.get('desc', '')} |")
+    lines += ["", "## 方法详情", ""]
+    for m in API["methods"]:
+        lines += [f"### `{m['name']}`", "", m.get("desc", ""), ""]
+        params = m.get("params") or []
+        if params:
+            lines += ["| 参数 | 类型 |", "|---|---|"]
+            for p in params:
+                t = p.get("type", "any")
+                if p.get("optional"):
+                    t += "（可选）"
+                if "default" in p:
+                    t += f"，默认 {p['default']}"
+                lines.append(f"| `{p['name']}` | {t} |")
+            lines.append("")
+        lines += ["返回：", "", "```json", json.dumps(m.get("result"), ensure_ascii=False, indent=2), "```", ""]
+    lines += ["## 发布订阅事件", ""]
+    for e in API["events"]:
+        lines += [f"### `{e['event']}`", "", e.get("desc", ""), "", "```json",
+                  json.dumps(e.get("fields"), ensure_ascii=False, indent=2), "```", ""]
+    lines += ["## 错误码", "", "| 错误码 | 含义 |", "|---|---|"]
+    for e in API["errors"]:
+        lines.append(f"| `{e['code']}` | {e['meaning']} |")
+    prof = API["profile_schema"]
+    lines += ["", "## 标定档案 profile", "", prof["description"], "", "| 字段 | 含义 |", "|---|---|"]
+    for k, v in prof["fields"].items():
+        if isinstance(v, dict):
+            v = "；".join(f"{kk}: {vv}" for kk, vv in v.items())
+        lines.append(f"| `{k}` | {v} |")
+    lines += ["", "换算公式：", "", "```", prof["formula"], "```", ""]
+    lines += ["## 配置项", "", "| 配置项 | 默认值 | 说明 |", "|---|---|---|"]
+    for c in API["config_fields"]:
+        lines.append(f"| `{c['key']}` | {c.get('default', '—')} | {c.get('desc', '')} |")
+    lines += ["", f"仓库：{API['packages']['repo']}；客户端：{API['packages']['python_client']}", ""]
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     OUT.write_text(HTML, encoding="utf-8")
+    md = render_markdown()
+    OUT_MD.write_text(md, encoding="utf-8")
     print(f"wrote {OUT} ({len(HTML.encode())} bytes)")
+    print(f"wrote {OUT_MD} ({len(md.encode())} bytes, KB 友好版)")
