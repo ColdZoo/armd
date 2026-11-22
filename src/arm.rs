@@ -177,7 +177,9 @@ impl ArmHandle {
             io: None,
             connected: false,
             rate_hz: cfg.poll_hz,
-            hz_ema: 0.0,
+            hz: 0.0,
+            polls_in_window: 0,
+            window_start: Instant::now(),
             next_poll: Instant::now(),
             last_poll_at: None,
             last_reconnect: Instant::now() - Duration::from_secs(3600),
@@ -231,7 +233,9 @@ struct Worker {
     io: Option<Box<dyn ArmIo>>,
     connected: bool,
     rate_hz: f64,
-    hz_ema: f64,
+    hz: f64,
+    polls_in_window: u32,
+    window_start: Instant,
     next_poll: Instant,
     last_poll_at: Option<Instant>,
     last_reconnect: Instant,
@@ -364,12 +368,14 @@ impl Worker {
                 for (id, data) in map {
                     joints.insert(id, dxl::le_int(&data));
                 }
-                if let Some(prev) = self.last_poll_at {
-                    let dt = prev.elapsed().as_secs_f64();
+                self.polls_in_window += 1;
+                if self.polls_in_window >= 30 {
+                    let dt = self.window_start.elapsed().as_secs_f64();
                     if dt > 0.0 {
-                        let hz = 1.0 / dt;
-                        self.hz_ema = if self.hz_ema == 0.0 { hz } else { self.hz_ema * 0.85 + hz * 0.15 };
+                        self.hz = self.polls_in_window as f64 / dt;
                     }
+                    self.polls_in_window = 0;
+                    self.window_start = Instant::now();
                 }
                 self.last_poll_at = Some(Instant::now());
                 {
@@ -378,7 +384,7 @@ impl Worker {
                     st.ts_ms = now_ms();
                     st.connected = true;
                     st.joints = joints;
-                    st.hz = self.hz_ema;
+                    st.hz = self.hz;
                     st.read_us = elapsed_us;
                     st.error = None;
                 }
