@@ -29,6 +29,8 @@ pub struct ArmState {
     pub hz: f64,
     pub error: Option<String>,
     pub read_us: u64,
+    /// 监控数据（每舵机：电压 V / 温度 ℃），`monitor: true` 时有效
+    pub health: BTreeMap<u8, (f64, i64)>,
 }
 
 impl ArmState {
@@ -43,6 +45,9 @@ impl ArmState {
             "hz": (self.hz * 10.0).round() / 10.0,
             "error": self.error,
             "read_us": self.read_us,
+            "health": self.health.iter().map(|(id, (v, t))| {
+                (id.to_string(), json!({"voltage": v, "temp": t}))
+            }).collect::<serde_json::Map<String, Value>>(),
         })
     }
 }
@@ -178,6 +183,7 @@ impl ArmHandle {
             connected: false,
             rate_hz: cfg.poll_hz,
             hz: 0.0,
+            last_monitor: Instant::now() - Duration::from_secs(3600),
             polls_in_window: 0,
             window_start: Instant::now(),
             next_poll: Instant::now(),
@@ -234,6 +240,7 @@ struct Worker {
     connected: bool,
     rate_hz: f64,
     hz: f64,
+    last_monitor: Instant,
     polls_in_window: u32,
     window_start: Instant,
     next_poll: Instant,
@@ -348,6 +355,33 @@ impl Worker {
         self.publish(frame);
     }
 
+    /// 每秒读一次电压/温度（两个寄存器一次 sync_read：144 电压 2B + 146 温度 1B = 3B）
+    fn poll_health(&mut self) {
+        if !self.cfg.monitor {
+            return;
+        }
+        if self.last_monitor.elapsed().as_secs_f64() < 1.0 {
+            return;
+        }
+        self.last_monitor = Instant::now();
+        let io = match self.io.as_mut() {
+            Some(io) => io,
+            None => return,
+        };
+        let mut health = BTreeMap::new();
+        if let Ok(map) = io.sync_read(144, 3, &self.cfg.motors, Duration::from_millis(50)) {
+            for (id, data) in map {
+                if data.len() >= 3 {
+                    let raw_v = (data[0] as u16) | ((data[1] as u16) << 8);
+                    health.insert(id, (raw_v as f64 / 10.0, data[2] as i64));
+                }
+            }
+        }
+        if !health.is_empty() {
+            self.state.write().unwrap().health = health;
+        }
+    }
+
     fn poll(&mut self) {
         let t0 = Instant::now();
         let result = match self.io.as_mut() {
@@ -392,6 +426,7 @@ impl Worker {
                     self.connected = true;
                     self.publish_event(true, None);
                 }
+                self.poll_health();
                 self.publish_state();
             }
             Err(e) => {

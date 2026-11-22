@@ -9,7 +9,15 @@
       "poll_hz": 60,
       "read_timeout_ms": 30,
       "reconnect_sec": 2.0,
-      "motors": [1, 2, 3, 4, 5, 6]
+      "motors": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "monitor": true
     },
     {
       "id": "koch_v1_1:follower",
@@ -19,7 +27,15 @@
       "poll_hz": 60,
       "read_timeout_ms": 30,
       "reconnect_sec": 2.0,
-      "motors": [1, 2, 3, 4, 5, 6]
+      "motors": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "monitor": true
     }
   ]
 }

@@ -225,11 +225,19 @@ impl SimPort {
 impl ArmIo for SimPort {
     fn sync_read(
         &mut self,
-        _addr: u16,
+        addr: u16,
         len: u16,
         ids: &[u8],
         _timeout: Duration,
     ) -> IoResult<BTreeMap<u8, Vec<u8>>> {
+        if addr == 144 {
+            // 仿真电压/温度：120 = 12.0V，35℃
+            let mut out = BTreeMap::new();
+            for id in ids {
+                out.insert(*id, vec![120, 0, 35]);
+            }
+            return Ok(out);
+        }
         let tick = self.tick();
         let mut out = BTreeMap::new();
         for id in ids {

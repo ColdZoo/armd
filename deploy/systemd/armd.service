@@ -1,0 +1,43 @@
+# ARM 下位机（Linux）上的 armd 服务
+#
+# 安装：
+#   sudo install -d /opt/armd /etc/armd
+#   sudo install -m755 armd /opt/armd/armd
+#   sudo install -m600 config.json /etc/armd/config.json
+#   sudo install -m644 armd.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now armd
+#
+# 串口权限：`sudo usermod -aG dialout $USER`（重新登录生效）
+# 谁占着总线：`lsof /dev/ttyACM0` 或 `fuser -v /dev/ttyACM0`
+#   常见冲突：`serial-getty@ttyS2`（Armbian 默认 UART 登录控制台）
+#   屏蔽：`sudo systemctl mask serial-getty@ttyS2`
+[Unit]
+Description=armd — Dynamixel 机械臂串口守护进程（RPC + 发布订阅）
+Documentation=https://github.com/ColdZoo/armd
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/armd/armd --config /etc/armd/config.json
+# 崩溃自动重启；单实例锁在进程内（/run/armd.sock.lock），重启不会抢占
+Restart=always
+RestartSec=3
+# 被 SIGTERM 时给在途写命令一点时间，别把舵机留在半截状态
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# 串口权限：armd 用户属于 dialout 组；或用 User=root
+User=armd
+Group=dialout
+
+# 与其它会碰串口的服务互斥（按需添加你原来的服务名）
+#Conflicts=robot-runtime.service
+#Conflicts=so101-serial.service
+
+# 控制线程优先级（可选）
+Nice=-5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

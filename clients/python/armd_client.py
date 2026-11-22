@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import socket
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -33,11 +34,25 @@ class ArmdError(Exception):
 
 
 class ArmdClient:
-    def __init__(self, path: str = DEFAULT_SOCKET, default_timeout: float = 2.0):
+    def __init__(self, path: str = DEFAULT_SOCKET, default_timeout: float = 2.0,
+                 token: Optional[str] = None):
+        """path 支持 `/tmp/armd.sock`（本机 Unix socket）或 `tcp://host:8771`（ARM 下位机等网络场景）。"""
         self.path = path
         self.default_timeout = default_timeout
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(path)
+        self.token = token or os.environ.get("ARMD_TOKEN") or None
+        if path.startswith("tcp://"):
+            host, _, port = path[len("tcp://"):].rpartition(":")
+            if not host or not port.isdigit():
+                raise ArmdError("bad_request", f"非法 TCP 地址 '{path}'（应为 tcp://host:port）")
+            self._sock = socket.create_connection((host, int(port)), timeout=10.0)
+            self._sock.settimeout(None)
+            try:
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+        else:
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._sock.connect(path)
         self._reader_f = self._sock.makefile("rb")
         self._writer_lock = threading.Lock()
         self._pending: Dict[int, list] = {}
@@ -48,6 +63,8 @@ class ArmdClient:
         self._closed = False
         self._reader = threading.Thread(target=self._read_loop, name="armd-reader", daemon=True)
         self._reader.start()
+        if self.token:
+            self.request("hello", token=self.token)
 
     # ------------------------------------------------------------ 底层
     def _read_loop(self) -> None:
@@ -243,7 +260,9 @@ def _main() -> None:
     import argparse
 
     ap = argparse.ArgumentParser(description="armd RPC 客户端")
-    ap.add_argument("--socket", default=DEFAULT_SOCKET)
+    ap.add_argument("--socket", default=DEFAULT_SOCKET,
+                    help="Unix socket 路径，或 tcp://host:port")
+    ap.add_argument("--token", default=None, help="访问令牌（也可用环境变量 ARMD_TOKEN）")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info")
     sub.add_parser("arms")
@@ -254,7 +273,7 @@ def _main() -> None:
     p = sub.add_parser("torque"); p.add_argument("arm"); p.add_argument("on", type=int)
     p = sub.add_parser("write"); p.add_argument("arm"); p.add_argument("motor", type=int); p.add_argument("address", type=int); p.add_argument("value", type=int); p.add_argument("--len", type=int, default=4)
     args = ap.parse_args()
-    c = ArmdClient(args.socket)
+    c = ArmdClient(args.socket, token=args.token)
     try:
         if args.cmd == "info":
             print(json.dumps(c.info(), ensure_ascii=False, indent=2))

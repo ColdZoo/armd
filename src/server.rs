@@ -6,20 +6,38 @@
 //! - 推送：`{"event":"state","sub":3,"arm":"...","seq":...,"joints":{...}}`
 //!          `{"event":"arm","sub":3,"arm":"...","connected":...}`
 
-use crate::arm::{ArmHandle, Cmd, Request, Sub};
+use crate::arm::{now_ms, ArmHandle, Cmd, Request, Sub};
 use crate::config::Config;
 use crate::dxl;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 一条客户端连接：Unix socket 或 TCP，对上层无差别。
+pub trait Conn: std::io::Read + std::io::Write + Send + 'static {
+    fn try_clone_conn(&self) -> std::io::Result<Box<dyn Conn>>;
+}
+
+impl Conn for std::os::unix::net::UnixStream {
+    fn try_clone_conn(&self) -> std::io::Result<Box<dyn Conn>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+}
+
+impl Conn for std::net::TcpStream {
+    fn try_clone_conn(&self) -> std::io::Result<Box<dyn Conn>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+}
 
 #[derive(Debug)]
 struct RpcError {
@@ -40,6 +58,9 @@ type RpcResult = Result<Value, RpcError>;
 
 pub struct Daemon {
     pub socket_path: String,
+    listen_specs: Vec<String>,
+    token: Option<String>,
+    identity_path: String,
     started: Instant,
     arms: HashMap<String, Arc<ArmHandle>>,
     subs: Mutex<HashMap<u64, Arc<Sub>>>,
@@ -56,6 +77,9 @@ impl Daemon {
         }
         Self {
             socket_path: cfg.socket.clone(),
+            listen_specs: cfg.listen_specs(),
+            token: cfg.token.clone(),
+            identity_path: cfg.identity.clone().unwrap_or_else(default_identity_path),
             started: Instant::now(),
             arms,
             subs: Mutex::new(HashMap::new()),
@@ -76,29 +100,121 @@ impl Daemon {
         })
     }
 
-    /// 启动监听（阻塞）。
+    /// 启动所有监听（阻塞）。监听地址来自配置 `listen`（unix:<path> / tcp://host:port）。
+    ///
+    /// 借鉴 robotd（pollen-robotics/microduck）的做法：
+    /// - 先把所有 listener **同步 bind 成功**再起线程，端口/路径被占用时立即失败；
+    /// - Unix socket 已存在时先探测：活着就拒绝启动，死了才清掉（绝不抢占别的 daemon）；
+    /// - 写 identity 文件（版本/pid/监听地址/机械臂），方便 `robotctl` 之类工具确认"谁在跑"。
     pub fn serve(self: Arc<Self>) -> std::io::Result<()> {
-        let _ = std::fs::remove_file(&self.socket_path);
-        let listener = UnixListener::bind(&self.socket_path)?;
-        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))?;
-        eprintln!("[armd] listening on {} (arms: {:?})", self.socket_path, self.arm_ids());
-        let mut conn_id = 0u64;
-        for stream in listener.incoming() {
-            if self.stop.load(Ordering::Relaxed) {
-                break;
-            }
-            match stream {
-                Ok(stream) => {
-                    conn_id += 1;
-                    self.spawn_conn(stream, conn_id);
+        let mut unix_listeners = Vec::new();
+        let mut tcp_listeners = Vec::new();
+        for spec in self.listen_specs.clone() {
+            if let Some(path) = spec.strip_prefix("unix:") {
+                if std::path::Path::new(path).exists() {
+                    match std::os::unix::net::UnixStream::connect(path) {
+                        Ok(_) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::AddrInUse,
+                                format!("{path} 已经被另一个 armd 监听，拒绝抢占"),
+                            ));
+                        }
+                        Err(_) => {
+                            eprintln!("[armd] 清理上次崩溃遗留的 socket: {path}");
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
                 }
-                Err(e) => eprintln!("[armd] accept error: {e}"),
+                let listener = UnixListener::bind(path)?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                eprintln!("[armd] listening on unix:{path} (arms: {:?})", self.arm_ids());
+                unix_listeners.push(listener);
+            } else if let Some(addr) = spec.strip_prefix("tcp://") {
+                let listener = TcpListener::bind(addr)?;
+                eprintln!("[armd] listening on tcp://{addr} (arms: {:?})", self.arm_ids());
+                tcp_listeners.push(listener);
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("非法监听地址 '{spec}'（支持 unix:<path> / tcp://host:port）"),
+                ));
             }
+        }
+        if unix_listeners.is_empty() && tcp_listeners.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "没有配置监听地址（listen / socket）",
+            ));
+        }
+        if let Err(e) = self.write_identity() {
+            eprintln!("[armd] identity 写入失败（不影响服务）: {e}");
+        }
+
+        let mut threads = Vec::new();
+        for listener in unix_listeners {
+            let daemon = self.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut conn_id = 0u64;
+                for stream in listener.incoming() {
+                    if daemon.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match stream {
+                        Ok(s) => {
+                            conn_id += 1;
+                            daemon.spawn_conn(Box::new(s), conn_id);
+                        }
+                        Err(e) => eprintln!("[armd] accept error (unix): {e}"),
+                    }
+                }
+            }));
+        }
+        for listener in tcp_listeners {
+            let daemon = self.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut conn_id = 0u64;
+                for stream in listener.incoming() {
+                    if daemon.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match stream {
+                        Ok(s) => {
+                            let _ = s.set_nodelay(true);
+                            conn_id += 1;
+                            daemon.spawn_conn(Box::new(s), conn_id);
+                        }
+                        Err(e) => eprintln!("[armd] accept error (tcp): {e}"),
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            let _ = t.join();
         }
         Ok(())
     }
 
-    fn spawn_conn(self: &Arc<Self>, stream: UnixStream, conn_id: u64) {
+    fn identity_json(&self) -> serde_json::Value {
+        json!({
+            "service": "armd",
+            "version": VERSION,
+            "pid": std::process::id(),
+            "started_ms": now_ms(),
+            "listen": self.listen_specs,
+            "token_required": self.token.is_some(),
+            "arms": self.arm_ids(),
+        })
+    }
+
+    fn write_identity(&self) -> std::io::Result<()> {
+        let body = self.identity_json().to_string();
+        if let Some(parent) = std::path::Path::new(&self.identity_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&self.identity_path, body)
+    }
+
+    fn spawn_conn(self: &Arc<Self>, stream: Box<dyn Conn>, conn_id: u64) {
         let daemon = self.clone();
         std::thread::Builder::new()
             .name(format!("conn-{conn_id}"))
@@ -106,8 +222,8 @@ impl Daemon {
             .ok();
     }
 
-    fn handle_conn(&self, stream: UnixStream, _conn_id: u64) {
-        let writer = match stream.try_clone() {
+    fn handle_conn(&self, stream: Box<dyn Conn>, _conn_id: u64) {
+        let writer = match stream.try_clone_conn() {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -136,6 +252,7 @@ impl Daemon {
         });
 
         let mut conn_subs: Vec<u64> = Vec::new();
+        let mut authed = self.token.is_none();
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             let line = match line {
@@ -156,13 +273,19 @@ impl Daemon {
                 }
             };
             let id = req.get("id").cloned().unwrap_or(Value::Null);
+            let is_jsonrpc = req.get("jsonrpc").is_some();
             let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
             let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-            let result = self.dispatch(&method, &params, &frame_tx, &mut conn_subs);
-            let resp = match result {
+            let result = self.dispatch(&method, &params, &frame_tx, &mut conn_subs, &mut authed);
+            let mut resp = match result {
                 Ok(v) => json!({ "id": id, "result": v }),
                 Err(e) => json!({ "id": id, "error": e.to_json() }),
             };
+            if is_jsonrpc {
+                if let Value::Object(map) = &mut resp {
+                    map.insert("jsonrpc".into(), json!("2.0"));
+                }
+            }
             if out_tx.send(resp.to_string()).is_err() {
                 break;
             }
@@ -192,8 +315,25 @@ impl Daemon {
         params: &Value,
         frame_tx: &SyncSender<String>,
         conn_subs: &mut Vec<u64>,
+        authed: &mut bool,
     ) -> RpcResult {
         match method {
+            // 握手：config.token 设置时必须先 hello
+            "hello" => {
+                let provided = params.get("token").and_then(|v| v.as_str());
+                match &self.token {
+                    None => {
+                        *authed = true;
+                        Ok(json!({ "ok": true, "auth_required": false, "version": VERSION }))
+                    }
+                    Some(expected) if provided == Some(expected.as_str()) => {
+                        *authed = true;
+                        Ok(json!({ "ok": true, "auth_required": true, "version": VERSION }))
+                    }
+                    Some(_) => Err(RpcError::new("unauthorized", "token 不正确")),
+                }
+            }
+            _ if !*authed => Err(RpcError::new("unauthorized", "需要先发送 hello（已配置 token）")),
             "ping" => Ok(json!({
                 "pong": true, "version": VERSION,
                 "uptime_sec": self.started.elapsed().as_secs(),
@@ -381,6 +521,39 @@ impl Daemon {
         out.sort_by(|a, b| a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or("")));
         out
     }
+}
+
+/// 单实例锁：`<socket>.lock` 上的 flock（File::try_lock）。
+///
+/// 借鉴 robotd：串口独占（serialport 已设 TIOCEXCL）只挡住非 root 的二次打开，
+/// 挡不住"另一个 armd 用 root 启动"。所以 daemon 必须在打开串口前先拿到锁。
+/// 锁文件**永不删除**（删掉会留下两个不同 inode 的竞争者），进程退出内核自动释放。
+pub fn acquire_instance_lock(socket: &str) -> std::io::Result<std::fs::File> {
+    let path = format!("{socket}.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.try_lock().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("另一个 armd 已经持有 {path}（若确认没有在跑，检查进程）: {e}"),
+        )
+    })?;
+    Ok(file)
+}
+
+fn default_identity_path() -> String {
+    // Linux（ARM 板）优先 /run/armd，macOS 退到 /tmp
+    let run_dir = std::path::Path::new("/run/armd");
+    if std::fs::metadata("/run").map(|m| m.is_dir()).unwrap_or(false)
+        && std::fs::create_dir_all(run_dir).is_ok()
+        && std::fs::metadata(run_dir).map(|m| m.permissions().readonly()).unwrap_or(true) == false
+    {
+        return "/run/armd/identity.json".to_string();
+    }
+    "/tmp/armd-identity.json".to_string()
 }
 
 fn call_arm(arm: &Arc<ArmHandle>, cmd: Cmd, urgent: bool, wait_ms: u64) -> RpcResult {

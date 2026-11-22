@@ -26,9 +26,31 @@ fn default_poll_len() -> u16 {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    /// 兼容旧配置：Unix socket 路径
     #[serde(default = "default_socket")]
     pub socket: String,
+    /// 监听地址列表，例如 ["unix:/tmp/armd.sock", "tcp://0.0.0.0:8771"]
+    /// 为空时等价于 ["unix:<socket>"]
+    #[serde(default)]
+    pub listen: Vec<String>,
+    /// 可选访问令牌：设置后客户端必须先发 `hello` 携带 token
+    #[serde(default)]
+    pub token: Option<String>,
+    /// 身份文件路径（默认 /tmp/armd-identity.json；/run/armd 可写时优先那里）
+    #[serde(default)]
+    pub identity: Option<String>,
     pub arms: Vec<ArmConfig>,
+}
+
+impl Config {
+    /// 实际监听地址（`socket` 作为向后兼容的默认值）
+    pub fn listen_specs(&self) -> Vec<String> {
+        if self.listen.is_empty() {
+            vec![format!("unix:{}", self.socket)]
+        } else {
+            self.listen.clone()
+        }
+    }
 }
 
 impl Config {
@@ -67,6 +89,9 @@ pub struct ArmConfig {
     pub poll_addr: Option<u16>,
     #[serde(default = "default_poll_len")]
     pub poll_len: u16,
+    /// 每秒额外读一次电压/温度（Present_Input_Voltage 144 + Present_Temperature 146）
+    #[serde(default)]
+    pub monitor: bool,
 }
 
 impl ArmConfig {

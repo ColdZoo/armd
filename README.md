@@ -94,13 +94,64 @@ launchctl bootout gui/$(id -u)/com.armd         # 停止
 - 本机 RPC 往返 <1ms；发送写命令到总线的延迟 ≤2ms（worker 每 2ms 检查一次队列）
 - 对比：之前 Python 直连时 macOS 定时器合并会把 60Hz 拖到 20Hz，只能靠自旋补偿
 
+## 部署到 ARM 开发板（下位机）
+
+目标拓扑：**机械臂的串口插在 ARM 板上，板上跑 armd；air.my / 手机 / 其他设备通过网络连它。**
+
+```
+   air.my（zeropose / 遥操作 / 脚本）        手机 / 平板
+        │  tcp://arm-board.my:8771              │ tcp://arm-board.my:8771
+        └───────────────┬───────────────────────┘
+                        ▼
+              ┌────────────────────┐
+              │  ARM 开发板（Linux） │  armd（systemd 服务）
+              │  /dev/ttyACM0/1     │  ← 独占两条 Dynamixel 总线
+              └─────────┬──────────┘
+                  主臂 / 从臂
+```
+
+步骤：
+
+```bash
+# 1) 编译：优先在板上直接 cargo build --release（最简单）
+#    交叉编译：./scripts/build-arm.sh   （cargo-zigbuild 或现成 aarch64 工具链）
+# 2) 拷到板上安装（systemd 单元 + 配置模板）
+scp target/release/armd arm-board:/tmp/
+scp configs/koch-arm-board.json arm-board:/tmp/config.json
+ssh arm-board 'cd /tmp && git clone … 或 scp deploy/ -r /tmp/'
+ssh arm-board 'sudo ./deploy/install-arm.sh /tmp/armd /tmp/config.json'
+# 3) 串口权限 + 屏蔽串口控制台（Armbian 常见坑）
+ssh arm-board 'sudo usermod -aG dialout armd; sudo systemctl mask serial-getty@ttyS2'
+# 4) 检查
+ssh arm-board 'systemctl status armd; cat /run/armd/identity.json; journalctl -u armd -n 20'
+```
+
+客户端侧（网络）：
+
+```bash
+# 配置里 listen 加了 tcp://0.0.0.0:8771 之后：
+python3 clients/python/armd_client.py --socket tcp://arm-board.my:8771 --token $ARMD_TOKEN arms
+# zeropose 直接走网络后端（ARMD_TOKEN 用环境变量传）：
+ARMD_TOKEN=$ARMD_TOKEN python -m zeropose --armd tcp://arm-board.my:8771
+```
+
+注意事项：
+
+- **只有板上的 armd 能碰串口**：air.my 上不要再起 armd（或把它的 `arms` 清空），否则两边会抢总线
+  （两个 armd 各自有单实例锁，但锁是"同一台机器同一路径"，跨机器靠人工约束）。
+- **网络一定要开 token**（`config.token`），否则局域网内任何设备都能写舵机寄存器。
+- 下位机没有桌面，`on_disconnect` 行为要提前想好：网络断了，舵机是保持最后姿态还是松力矩 ——
+  目前 armd 默认维持 `Torque_Enable` 不变（不主动上电/断电），上电保持姿态属于应用层策略。
+- 网络传输（NDJSON，60Hz×6 电机 ≈ 1–2 KB/s）带宽压力很小；但延迟从本机 <1ms 变成 Wi-Fi/LAN 的 2–20ms，
+  遥操作类应用建议在客户端做插值/前瞻。
+
 ## 结构
 
 ```
 src/dxl.rs        Dynamixel Protocol 2.0（CRC/帧构造/解析，真机字节流验证）
 src/port.rs       串口传输层（真实串口 + sim 实现，同一 trait）
 src/arm.rs        每臂 worker：队列/轮询/状态缓存/发布/重连
-src/server.rs     Unix socket RPC + 发布订阅（NDJSON）
+src/server.rs     Unix socket / TCP RPC + 发布订阅（NDJSON），单实例锁、identity 文件
 src/config.rs     配置
 clients/python/   Python 客户端
 docs/DESIGN.md    架构、RPC 协议全文、队列与背压设计

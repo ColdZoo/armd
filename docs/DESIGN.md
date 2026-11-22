@@ -137,3 +137,40 @@ armd 进程
 - arm id 约定 `<robot>:<role>`，与 ZeroPose 的「型号-主从」一致。
 - LaunchAgent：`com.armd` 先起（独占串口），`com.zeropose.web` 加 `--armd`；
   zeropose 启动时若 socket 未就绪会每 3s 自动重试。
+
+## 9. 单实例、身份文件、防抢占（借鉴 robotd）
+
+- **串口独占的两层**：`serialport` 已经设了 `TIOCEXCL` + 独占 flock（非 root 第二次打开会 EBUSY），
+  但 root 不受影响 —— 所以 armd 自己在打开串口前先拿 `<socket>.lock` 的 `File::try_lock()`：
+  第二个实例直接启动失败，绝不出现"两个 armd 各读一半状态包"。
+  锁文件**永不删除**（删了会出现两个 inode 的竞争者），进程退出内核自动释放。
+- **不抢占活着的 socket**：启动时如果 socket 路径存在，先尝试连接：
+  能连上 → 说明另一个 daemon 活着，拒绝启动；连不上 → 判定为崩溃残留，才删除重建。
+- **identity 文件**（Linux `/run/armd/identity.json`，macOS `/tmp/armd-identity.json`）：
+  `{service, version, pid, started_ms, listen, token_required, arms}`。
+  工具可以据此确认"当前到底是谁在跑、什么版本、监听哪些地址"。
+- **systemd**：`Restart=always`、`KillSignal=SIGTERM`、`TimeoutStopSec=10`；
+  与旧串口程序互斥用 `Conflicts=`（模板里给了注释示例）。
+
+## 10. ARM 下位机适配
+
+- 同一个二进制跑在 macOS（air.my）或 ARM Linux（下位机）：传输层只依赖 Unix socket / TCP，
+  串口层只依赖 Linux termios / macOS 的 tty（`serialport` crate 两者都支持）。
+- 监听列表 `listen: ["unix:/run/armd.sock", "tcp://0.0.0.0:8771"]`，Unix 给本机工具、TCP 给网络客户端。
+- `config.token` 设置后，客户端必须先 `hello` 带 token，否则所有方法返回 `unauthorized`。
+- 只读遥测：`monitor: true` 时每秒额外 `sync_read` 一次 `Present_Input_Voltage(144,2B) + Present_Temperature(146,1B)`，
+  在 `arm.state.health` 里给出 `{voltage, temp}`，供下位机做掉电/过温保护。
+- 交叉编译：`scripts/build-arm.sh`（`aarch64-unknown-linux-gnu`，支持 cargo-zigbuild 或板上编译）。
+
+## 11. 参考实现对比（2026-11 调研）
+
+| 项目 | 做了什么 | 我们借鉴了什么 | 没照搬的原因 |
+|---|---|---|---|
+| [pollen-robotics/microduck](https://github.com/pollen-robotics/microduck)（`docs/design/robotd-design.md`、`architecture.md`） | 轮足机器人板载 `robotd`：单进程单总线 50Hz 控制环，JSON-RPC 2.0 + NDJSON over unix socket，intents 进 / state 出，订阅限流，safety 层独占总线，单实例锁 + identity.json + systemd `Conflicts=` | 单实例锁 + 防抢占 socket + identity 文件；JSON-RPC 2.0 兼容；订阅限流；"控制环线程不能被 IPC 挡住"的分层 | 它是板载闭环+策略推理（intents/safety），我们目前是标定/遥操作取数，先保持底层寄存器 API |
+| [pollen-robotics/rustypot](https://github.com/pollen-robotics/rustypot)、[createra-robotics/rust_servocom](https://github.com/createra-robotics/rust_servocom) | Rust 的 Dynamixel/Feetech 协议库（v1/v2、sync read/write、控制表、扫描工具、pyo3 绑定） | 协议层与"控制器拥有 io"分层的写法；扫描/寄存器工具的思路；pyo3 绑定可替代手写客户端 | 我们只需要 X 系列 + protocol 2.0，自实现 ~300 行更可控；后续可切 rustypot 减少维护 |
+| [dora-rs](https://dora-rs.ai/) | 分布式数据流：topic/service/action/streaming 四种模式，本地共享内存 + 跨机 Zenoh | 四种通信模式的划分（我们目前只有 RPC + topic 推送）；跨机通信用 Zenoh 的取舍 | 引入 dora 会把整个运行时带进来；NDJSON 更轻 |
+| lerobot `unitree_g1/unitree_sdk2_socket.py` | ZMQ PUSH/SUB，`CONFLATE=1`，低频命令 + 高频最新状态 | **状态只保留最新一帧**（我们的 per-subscriber 丢帧队列等价）；命令通道与状态通道分离 | ZMQ 需要额外依赖；现有 NDJSON 在 60Hz 足够 |
+| [autonomous-ai/lampOS](https://github.com/autonomous-ai/lampOS)（`robots/so101/ROBOT.md`） | 家庭机器人网关：`autonomous.device.v1` schema，websocket 协议，policy/camera/system 分路由 | 设备清单 schema 化的思路；websocket 作为前端实时通道 | 我们是"驱动"不是"网关"；websocket 前端由 zeropose 自己做 |
+| [DipFlip/telegrip](https://deepwiki.com/DipFlip/telegrip/8-api-reference) | SO100 遥操作：REST（配置/状态）+ WebSocket（VR 控制流） | HTTP/WS 双通道的取舍（静态/低频 Rest，实时走 WS） | 我们的实时流走 pub/sub 更直接 |
+| [jess-moss/koch-v1-1](https://github.com/jess-moss/koch-v1-1)、[strands-labs/robots](https://github.com/strands-labs/robots/blob/main/docs/robots/koch.md) | Koch v1.1 原始硬件/驱动、lerobot `DynamixelDriver` 封装 | 电机型号表（XL430×2 + XL330×4）与我们一致；`DynamixelDriver` 这种"设备对象"命名 | 无需移植 |
+| [IliaLarchenko/robot_MCP](https://github.com/IliaLarchenko/robot_MCP) | 把 SO-ARM100 包装成 MCP tool 给 LLM 用 | 未来给 LLM/agent 用可以加一层 MCP 适配（不放进 armd 核心） | 驱动层保持最小 |

@@ -77,6 +77,9 @@ fn main() {
         } else {
             Config {
                 socket: socket.clone().unwrap_or_else(|| "/tmp/armd.sock".into()),
+                listen: Vec::new(),
+                token: None,
+                identity: None,
                 arms: vec![ArmConfig {
                     id: "sim".into(),
                     label: "sim arm".into(),
@@ -89,6 +92,7 @@ fn main() {
                     motors: ids,
                     poll_addr: None,
                     poll_len: 4,
+                    monitor: false,
                 }],
             }
         }
@@ -107,6 +111,17 @@ fn main() {
         c
     };
 
+    // 单实例：必须在打开串口前拿锁（避免两个 armd 同时驱动同一条总线）
+    let lock_socket = cfg.listen_specs().iter()
+        .find_map(|s| s.strip_prefix("unix:").map(|p| p.to_string()))
+        .unwrap_or_else(|| cfg.socket.clone());
+    let _instance_lock = match armd::server::acquire_instance_lock(&lock_socket) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[armd] 启动失败: {e}");
+            std::process::exit(1);
+        }
+    };
     let daemon = Arc::new(Daemon::new(&cfg));
     println!("[armd] {} 个机械臂: {:?}", cfg.arms.len(), daemon.arm_ids());
     if let Err(e) = daemon.serve() {
