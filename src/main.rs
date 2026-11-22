@@ -93,6 +93,8 @@ fn main() {
                     poll_addr: None,
                     poll_len: 4,
                     monitor: false,
+                    joint_names: Default::default(),
+                    profile: None,
                 }],
             }
         }

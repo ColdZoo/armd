@@ -5,7 +5,8 @@ edition = "2021"
 description = "Dynamixel arm daemon: sole owner of the serial bus, exposes RPC + pub/sub over a Unix socket"
 
 [dependencies]
-serialport = "4.7"
+# Linux 上默认会拉 libudev（需要 sysroot/pkg-config），我们只按路径开串口，不需要枚举
+serialport = { version = "4.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

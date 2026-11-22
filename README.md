@@ -81,6 +81,21 @@ launchctl bootout gui/$(id -u)/com.armd         # 停止
 | `poll_addr` / `poll_len` | 132 / 4 | 轮询寄存器（默认 Present_Position） |
 | `sim` | false | 仿真臂 |
 
+## 标定档案（profile）
+
+标定数据（零位 / 方向 / 夹爪行程）由 armd 持有，**所有应用通过 RPC 读写**，不再各存一份：
+
+```bash
+python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:follower   # 读取
+python3 clients/python/armd_client.py --socket /tmp/armd.sock snapshot koch_v1_1:follower  # 采点：raw(按关节名)+角度+电压温度
+python3 clients/python/armd_client.py --socket /tmp/armd.sock profile koch_v1_1:follower --set profile.json
+```
+
+- 文件：`~/.config/armd/profiles/<arm-id>.json`（可在配置里用 `profile` 覆盖路径）
+- 配置里 `joint_names` 声明「舵机 id → 关节名」，armd 才能校验 profile 并换算角度
+- `arm.state` 会带 `deg`（标定后的关节角）和 `health`（电压/温度），其他应用直接可用
+- 插上臂第一次启动时，若 armd 没有 profile，zeropose 会自动把本地旧标定迁移进来
+
 ## 客户端
 
 - Python（零依赖，标准库）：[`clients/python/armd_client.py`](clients/python/armd_client.py)
@@ -113,8 +128,10 @@ launchctl bootout gui/$(id -u)/com.armd         # 停止
 步骤：
 
 ```bash
-# 1) 编译：优先在板上直接 cargo build --release（最简单）
-#    交叉编译：./scripts/build-arm.sh   （cargo-zigbuild 或现成 aarch64 工具链）
+# 1) 编译：本机交叉编译已验证（aarch64 / armv7 都产出 ELF）：
+./scripts/build-arm.sh          # → dist/armd-aarch64、dist/armd-armv7
+#    或者直接在板上 cargo build --release
+#    CI：.github/workflows/arm.yml 打 tag 时自动产出两个架构的 artifact
 # 2) 拷到板上安装（systemd 单元 + 配置模板）
 scp target/release/armd arm-board:/tmp/
 scp configs/koch-arm-board.json arm-board:/tmp/config.json

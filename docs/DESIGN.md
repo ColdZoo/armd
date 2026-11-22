@@ -174,3 +174,20 @@ armd 进程
 | [DipFlip/telegrip](https://deepwiki.com/DipFlip/telegrip/8-api-reference) | SO100 遥操作：REST（配置/状态）+ WebSocket（VR 控制流） | HTTP/WS 双通道的取舍（静态/低频 Rest，实时走 WS） | 我们的实时流走 pub/sub 更直接 |
 | [jess-moss/koch-v1-1](https://github.com/jess-moss/koch-v1-1)、[strands-labs/robots](https://github.com/strands-labs/robots/blob/main/docs/robots/koch.md) | Koch v1.1 原始硬件/驱动、lerobot `DynamixelDriver` 封装 | 电机型号表（XL430×2 + XL330×4）与我们一致；`DynamixelDriver` 这种"设备对象"命名 | 无需移植 |
 | [IliaLarchenko/robot_MCP](https://github.com/IliaLarchenko/robot_MCP) | 把 SO-ARM100 包装成 MCP tool 给 LLM 用 | 未来给 LLM/agent 用可以加一层 MCP 适配（不放进 armd 核心） | 驱动层保持最小 |
+
+## 12. 标定档案（profile）与 ZeroPose 迁移
+
+**原则：标定数据的唯一事实源是 armd**，应用不再各存一份 JSON。
+
+- schema（与 zeropose 兼容）：
+  `{zero:{joint:raw}, sign:{joint:±1}, grip:{open,closed,angle?}, spin:{wrist_roll?}, savedAt}`
+- 校验在 armd 里做（`src/profile.rs`）：raw 0..4095、sign ±1、夹爪跨度 ≥100、angle 5..140.5°；
+  关节覆盖按配置里的 `joint_names` 检查。
+- 持久化：每臂一个文件（默认 `~/.config/armd/profiles/<arm-id>.json`），临时文件 + rename 原子替换。
+- `arm.state` 附带 `deg`（用 profile 换算的关节角，连续关节做 ±2048 wrap）和 `health`；
+  其他应用（zeropose、遥操作脚本、可视化）不需要自己实现 raw→角度换算。
+- ZeroPose 的接线（`zeropose/armd_backend.py` + `zeropose/server.py`）：
+  - `/api/alignment` 的 GET/POST/DELETE 直接转发到 `arm.profile.*`；
+  - 第一次连上 armd 时，若 armd 没有 profile、本地 `~/.config/zeropose/<robot>-<role>.json` 存在 → 一次性推送迁移；
+  - 保存时同时写一份本地镜像（备份/可回退），读取优先 armd；
+  - 订阅帧超过 1 秒没更新（armd 重启/断流）→ 当作掉线，会话自动重连并重新迁移/读取。

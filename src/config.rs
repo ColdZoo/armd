@@ -92,6 +92,12 @@ pub struct ArmConfig {
     /// 每秒额外读一次电压/温度（Present_Input_Voltage 144 + Present_Temperature 146）
     #[serde(default)]
     pub monitor: bool,
+    /// 舵机 id → 关节名（如 {"1": "shoulder_pan", ...}），用于标定 profile 与角度换算
+    #[serde(default)]
+    pub joint_names: std::collections::BTreeMap<String, String>,
+    /// 标定档案路径（默认 ~/.config/armd/profiles/<arm-id>.json）
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl ArmConfig {

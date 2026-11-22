@@ -143,6 +143,26 @@ class ArmdClient:
     def state(self, arm: str) -> dict:
         return self.request("arm.state", arm=arm)
 
+    def profile(self, arm: str) -> dict:
+        """读取标定档案 {profile, path, has_profile}。"""
+        return self.request("arm.profile.get", arm=arm)
+
+    def set_profile(self, arm: str, profile: dict) -> dict:
+        """保存标定档案（由 armd 校验并持久化）。"""
+        return self.request("arm.profile.set", arm=arm, profile=profile)
+
+    def delete_profile(self, arm: str) -> dict:
+        return self.request("arm.profile.delete", arm=arm)
+
+    def calibration_snapshot(self, arm: str) -> dict:
+        """一次取当前 raw（按关节名）/角度/健康，用于标定采点。"""
+        return self.request("arm.calibration.snapshot", arm=arm)
+
+    def degrees(self, arm: str) -> Optional[dict]:
+        """当前关节角（度）；没有 profile 时为 None。"""
+        st = self.state(arm)
+        return st.get("deg") or None
+
     def read(self, arm: str, motors: Optional[Iterable[int]] = None, timeout_ms: int = 50) -> dict:
         params: dict = {"arm": arm, "timeout_ms": timeout_ms}
         if motors is not None:
@@ -269,6 +289,10 @@ def _main() -> None:
     p = sub.add_parser("state"); p.add_argument("arm")
     p = sub.add_parser("read"); p.add_argument("arm")
     p = sub.add_parser("stats"); p.add_argument("arm")
+    p = sub.add_parser("profile"); p.add_argument("arm")
+    p.add_argument("--set", default=None, help="profile JSON 文件路径")
+    p.add_argument("--delete", action="store_true")
+    p = sub.add_parser("snapshot"); p.add_argument("arm")
     p = sub.add_parser("watch"); p.add_argument("arm"); p.add_argument("--rate", type=float, default=10.0)
     p = sub.add_parser("torque"); p.add_argument("arm"); p.add_argument("on", type=int)
     p = sub.add_parser("write"); p.add_argument("arm"); p.add_argument("motor", type=int); p.add_argument("address", type=int); p.add_argument("value", type=int); p.add_argument("--len", type=int, default=4)
@@ -283,6 +307,17 @@ def _main() -> None:
             print(json.dumps(c.state(args.arm), ensure_ascii=False, indent=2))
         elif args.cmd == "read":
             print(json.dumps(c.read(args.arm), ensure_ascii=False, indent=2))
+        elif args.cmd == "snapshot":
+            print(json.dumps(c.calibration_snapshot(args.arm), ensure_ascii=False, indent=2))
+        elif args.cmd == "profile":
+            if args.delete:
+                print(json.dumps(c.delete_profile(args.arm)))
+            elif args.set:
+                with open(args.set, encoding="utf-8") as fp:
+                    out = c.set_profile(args.arm, json.load(fp))
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps(c.profile(args.arm), ensure_ascii=False, indent=2))
         elif args.cmd == "stats":
             print(json.dumps(c.stats(args.arm), ensure_ascii=False, indent=2))
         elif args.cmd == "torque":

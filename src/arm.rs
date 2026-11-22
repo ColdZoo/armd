@@ -9,6 +9,7 @@
 use crate::config::ArmConfig;
 use crate::dxl;
 use crate::port::{ArmIo, DxlPort, IoError, SimPort};
+use crate::profile::{joint_degrees, ProfileStore};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -31,6 +32,11 @@ pub struct ArmState {
     pub read_us: u64,
     /// 监控数据（每舵机：电压 V / 温度 ℃），`monitor: true` 时有效
     pub health: BTreeMap<u8, (f64, i64)>,
+    /// 有 profile 时的关节角（度）
+    pub deg: BTreeMap<String, f64>,
+    /// 舵机 id -> 关节名
+    pub joint_names: BTreeMap<String, String>,
+    pub profile_saved_at: Option<i64>,
 }
 
 impl ArmState {
@@ -48,6 +54,11 @@ impl ArmState {
             "health": self.health.iter().map(|(id, (v, t))| {
                 (id.to_string(), json!({"voltage": v, "temp": t}))
             }).collect::<serde_json::Map<String, Value>>(),
+            "joint_names": self.joint_names.iter().map(|(k, v)| (k.clone(), json!(v)))
+                .collect::<serde_json::Map<String, Value>>(),
+            "deg": self.deg.iter().map(|(k, v)| (k.clone(), json!((v * 100.0).round() / 100.0)))
+                .collect::<serde_json::Map<String, Value>>(),
+            "profile_saved_at": self.profile_saved_at,
         })
     }
 }
@@ -160,6 +171,8 @@ pub struct Request {
 
 pub struct ArmHandle {
     pub cfg: ArmConfig,
+    pub profile_store: ProfileStore,
+    pub profile: Arc<Mutex<Option<Value>>>,
     pub urgent: SyncSender<Request>,
     pub normal: SyncSender<Request>,
     pub state: Arc<RwLock<ArmState>>,
@@ -176,6 +189,10 @@ impl ArmHandle {
         let subs: Arc<Mutex<Vec<Arc<Sub>>>> = Arc::new(Mutex::new(Vec::new()));
         let stats = Arc::new(Stats::default());
         let stop = Arc::new(AtomicBool::new(false));
+        let profile_store = ProfileStore::new(
+            cfg.profile.clone().map(Into::into)
+                .unwrap_or_else(|| ProfileStore::default_path(&cfg.id)));
+        let profile = Arc::new(Mutex::new(profile_store.load()));
 
         let mut worker = Worker {
             cfg: cfg.clone(),
@@ -193,6 +210,7 @@ impl ArmHandle {
             state: state.clone(),
             subs: subs.clone(),
             stats: stats.clone(),
+            profile: profile.clone(),
         };
 
         let worker_cfg = cfg.clone();
@@ -204,6 +222,8 @@ impl ArmHandle {
 
         Arc::new(Self {
             cfg,
+            profile_store,
+            profile,
             urgent: urgent_tx,
             normal: normal_tx,
             state,
@@ -250,6 +270,7 @@ struct Worker {
     state: Arc<RwLock<ArmState>>,
     subs: Arc<Mutex<Vec<Arc<Sub>>>>,
     stats: Arc<Stats>,
+    profile: Arc<Mutex<Option<Value>>>,
 }
 
 impl Worker {
@@ -412,15 +433,21 @@ impl Worker {
                     self.window_start = Instant::now();
                 }
                 self.last_poll_at = Some(Instant::now());
+                let profile = self.profile.lock().unwrap().clone();
                 {
                     let mut st = self.state.write().unwrap();
                     st.seq += 1;
                     st.ts_ms = now_ms();
                     st.connected = true;
-                    st.joints = joints;
+                    st.joints = joints.clone();
                     st.hz = self.hz;
                     st.read_us = elapsed_us;
                     st.error = None;
+                    st.joint_names = self.cfg.joint_names.clone();
+                    if let Some(p) = &profile {
+                        st.deg = joint_degrees(&joints, &self.cfg.joint_names, p);
+                        st.profile_saved_at = p.get("savedAt").and_then(|v| v.as_i64());
+                    }
                 }
                 if !self.connected {
                     self.connected = true;

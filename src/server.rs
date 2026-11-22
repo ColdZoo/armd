@@ -9,6 +9,7 @@
 use crate::arm::{now_ms, ArmHandle, Cmd, Request, Sub};
 use crate::config::Config;
 use crate::dxl;
+use crate::profile::{joint_degrees, validate as validate_profile};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -357,6 +358,69 @@ impl Daemon {
                 }
                 Ok(v)
             }
+            "arm.profile.get" => {
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let profile = arm.profile.lock().unwrap().clone();
+                Ok(json!({
+                    "profile": profile,
+                    "path": arm.profile_store.path().to_string_lossy(),
+                    "has_profile": profile.is_some(),
+                }))
+            }
+            "arm.profile.set" => {
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let payload = params
+                    .get("profile")
+                    .ok_or_else(|| RpcError::new("bad_request", "缺少 profile 对象"))?;
+                let clean = validate_profile(payload, &arm.cfg.joint_names)
+                    .map_err(|e| RpcError::new("bad_request", e))?;
+                arm.profile_store
+                    .save(&clean)
+                    .map_err(|e| RpcError::new("io_error", e))?;
+                *arm.profile.lock().unwrap() = Some(clean.clone());
+                {
+                    let mut st = arm.state.write().unwrap();
+                    if !st.joints.is_empty() {
+                        st.deg = joint_degrees(&st.joints, &arm.cfg.joint_names, &clean);
+                    }
+                    st.profile_saved_at = clean.get("savedAt").and_then(|v| v.as_i64());
+                }
+                Ok(json!({ "profile": clean, "path": arm.profile_store.path().to_string_lossy() }))
+            }
+            "arm.profile.delete" => {
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let deleted = arm.profile_store.delete();
+                *arm.profile.lock().unwrap() = None;
+                {
+                    let mut st = arm.state.write().unwrap();
+                    st.deg.clear();
+                    st.profile_saved_at = None;
+                }
+                Ok(json!({ "deleted": deleted }))
+            }
+            "arm.calibration.snapshot" => {
+                let arm = self.arm(&str_param(params, "arm")?)?;
+                let st = arm.state.read().unwrap();
+                let names = &arm.cfg.joint_names;
+                let raw: serde_json::Map<String, Value> = st
+                    .joints
+                    .iter()
+                    .map(|(id, v)| {
+                        let name = names.get(&id.to_string()).cloned().unwrap_or_else(|| id.to_string());
+                        (name, json!(v))
+                    })
+                    .collect();
+                Ok(json!({
+                    "raw": raw,
+                    "deg": st.deg,
+                    "seq": st.seq,
+                    "ts": st.ts_ms,
+                    "connected": st.connected,
+                    "health": st.health.iter().map(|(id, (v, t))| {
+                        (id.to_string(), json!({"voltage": v, "temp": t}))
+                    }).collect::<serde_json::Map<String, Value>>(),
+                }))
+            }
             "arm.read" => {
                 let arm = self.arm(&str_param(params, "arm")?)?;
                 let ids = optional_motors(params).unwrap_or_else(|| arm.cfg.motors.clone());
@@ -515,6 +579,7 @@ impl Daemon {
                 "hz": (st.hz * 10.0).round() / 10.0,
                 "seq": st.seq,
                 "error": st.error,
+                "profile_saved_at": st.profile_saved_at,
                 "stats": arm.stats.to_json(),
             }));
         }

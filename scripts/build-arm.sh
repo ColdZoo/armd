@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# 交叉编译 armd 到 ARM Linux（64 位）。
+# 交叉编译 armd 到 ARM Linux（64 位 / 32 位）。
 #
-# 方案 A（推荐）：cargo-zigbuild（需要 zig，跨平台链接最省事）
-#   brew install zig && cargo install cargo-zigbuild
-#   rustup target add aarch64-unknown-linux-gnu
-#   ./scripts/build-arm.sh
+# 依赖（macOS 本机已装）：
+#   brew install zig
+#   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal   # 提供 rustup target
+#   ~/.cargo/bin/rustup target add aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf
+#   ~/.cargo/bin/cargo install cargo-zigbuild --locked
 #
-# 方案 B：在 ARM 板上直接编译（最简单，板上 `rustup target add` 后 cargo build --release）
-# 方案 C：CI/容器里用 aarch64 工具链
+# 产物：dist/armd-aarch64  dist/armd-armv7（同时保留在 target/<triple>/release/）
+# 注：serialport 已关闭 libudev 默认特性，交叉编译不需要 ARM sysroot。
 set -euo pipefail
-TARGET="${TARGET:-aarch64-unknown-linux-gnu}"
-echo "==> 目标: $TARGET"
-rustup target list --installed | grep -q "$TARGET" || rustup target add "$TARGET"
-if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
-  echo "==> 使用 cargo-zigbuild"
-  cargo zigbuild --release --target "$TARGET"
-else
-  echo "==> 尝试普通交叉编译（需要现成的 ${TARGET%%-*}-linux-gnu-gcc 链接器）"
-  cargo build --release --target "$TARGET"
-fi
-BIN="target/$TARGET/release/armd"
-[ -f "$BIN" ] || BIN="/tmp/armd-target/$TARGET/release/armd"
-echo "==> 产物: $BIN"
-file "$BIN" || true
-echo "把它们拷到板上：scp $BIN arm-board:/tmp/armd && ssh arm-board 'sudo install -m755 /tmp/armd /opt/armd/armd'"
+cd "$(dirname "$0")/.."
+CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
+mkdir -p dist
+for target in aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf; do
+  echo "==> $target"
+  case "$target" in
+    aarch64*) out="dist/armd-aarch64" ;;
+    armv7*)   out="dist/armd-armv7" ;;
+  esac
+  "$CARGO" zigbuild --release --target "$target"
+  cp "/tmp/armd-target/$target/release/armd" "$out"
+  file "$out"
+done
+echo "完成：dist/armd-aarch64 dist/armd-armv7"
